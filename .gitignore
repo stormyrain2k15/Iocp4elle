@@ -106,3 +106,7 @@ ElleAnn/.vs/ElleAnn.slnx/v18/Insiders/ipch/AutoPCH/c4b3da6995266610/SERVICE.ipch
 ElleAnn/.vs/ElleAnn.slnx/v18/Insiders/ipch/AutoPCH/cfd514ec885fa3e2/MAIN.ipch
 ElleAnn/.vs/ElleAnn.slnx/v18/Insiders/ipch/AutoPCH/8a372b47bc755bed/SERVICE.ipch
 ElleAnn/.vs/ElleAnn.slnx/v18/Insiders/ipch/AutoPCH/303f2ae4ea7c45f1/SERVICE.ipch
+-e 
+# Environment files
+*.env
+*.env.*
