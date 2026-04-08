@@ -142,3 +142,7 @@ ElleAnn/.vs/ElleAnn.slnx/v18/Insiders/ipch/AutoPCH/303f2ae4ea7c45f1/SERVICE.ipch
 # Environment files
 *.env
 *.env.*
+-e 
+# Environment files
+*.env
+*.env.*
