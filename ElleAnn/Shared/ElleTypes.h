@@ -73,6 +73,9 @@ enum class ElleResult : DWORD
     ERR_NETWORK_BIND        = 90,
     ERR_NETWORK_SEND        = 91,
     ERR_NETWORK_RECV        = 92,
+    ERR_NETWORK_CONNECT     = 93,
+    ERR_TIMEOUT             = 100,
+    ERR_IPC_REMOTE_ERROR    = 110,
     ERR_NOT_IMPLEMENTED     = 999
 };
 
