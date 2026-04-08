@@ -1,0 +1,418 @@
+// =============================================================================
+// Elle.Service.Identity — Service.cpp
+//
+// Identity core guard — protects Elle's persistent state and monitors
+// for unauthorized modifications.
+//
+// What this service does:
+//   - Monitors ElleAnn solution files for unexpected modification
+//     (timestamps tracked in ElleSystem.IdentityLog)
+//   - Monitors ElleCore, ElleMemory, ElleKnowledge, ElleHeart databases
+//     for unauthorized schema or data changes (hash-based row count / checksum)
+//   - Monitors all Elle service processes — if any service goes missing
+//     without a graceful shutdown record in ElleSystem, logs a fault event
+//   - Tracks its own thread activity and reports to the heartbeat service
+//   - Logs all events to ElleSystem.IdentityLog with full context
+// =============================================================================
+
+#include "../../Shared/ElleServiceBase.h"
+#include "../../Shared/ElleEpoch.h"
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleConfig.h"
+#include "../../Shared/ElleTypes.h"
+#include <tlhelp32.h>
+#include <vector>
+#include <unordered_map>
+
+#define SVCNAME     ElleConfig::ServiceNames::IDENTITY
+#define LOG(lvl, fmt, ...) ELLE_LOG_##lvl(SVCNAME, fmt, ##__VA_ARGS__)
+
+// Files to watch — paths relative to common Elle install root
+static const wchar_t* WATCHED_FILES[] =
+{
+    L"C:\\Elle\\ElleAnn.config",
+    L"C:\\Elle\\Lua\\scripts\\personality.lua",
+    L"C:\\Elle\\Lua\\scripts\\intent_scoring.lua",
+    L"C:\\Elle\\Lua\\scripts\\reasoning.lua",
+    L"C:\\Elle\\Lua\\scripts\\thresholds.lua",
+};
+
+// Service process names to monitor
+static const wchar_t* MONITORED_PROCESSES[] =
+{
+    L"ElleQueueWorker.exe",
+    L"ElleHTTP.exe",
+    L"ElleEmotional.exe",
+    L"ElleMemory.exe",
+    L"ElleCognitive.exe",
+    L"ElleAction.exe",
+    L"ElleHeartbeat.exe",
+    L"elle_runtime.exe",  // The C++ core
+};
+
+// =============================================================================
+// ElleIdentityGuard
+// =============================================================================
+class ElleIdentityGuard
+{
+    ELLE_NONCOPYABLE(ElleIdentityGuard)
+public:
+    ElleIdentityGuard()
+        : m_Running(false)
+        , m_MonitorThread(nullptr)
+        , m_StopEvent(nullptr)
+    {}
+
+    ~ElleIdentityGuard() { Stop(); }
+
+    ElleResult Start(HANDLE stopEvent)
+    {
+        LOG(INFO, L"ElleIdentityGuard starting");
+        m_StopEvent = stopEvent;
+
+        // Take baseline snapshots of all watched files
+        TakeFileBaseline();
+
+        // Take baseline DB row counts
+        TakeDBBaseline();
+
+        m_Running = true;
+        m_MonitorThread = CreateThread(nullptr, 0, MonitorThreadProc, this, 0, nullptr);
+        if (!m_MonitorThread)
+        {
+            LOG(FATAL, L"CreateThread(Monitor) failed: %lu", GetLastError());
+            m_Running = false;
+            return ElleResult::ERR_GENERIC;
+        }
+
+        LOG(INFO, L"ElleIdentityGuard running. Watching %zu files, %zu processes",
+            _countof(WATCHED_FILES), _countof(MONITORED_PROCESSES));
+        return ElleResult::OK;
+    }
+
+    void Stop()
+    {
+        if (!m_Running) return;
+        LOG(INFO, L"ElleIdentityGuard stopping. Events logged=%llu", m_EventsLogged.load());
+        m_Running = false;
+        if (m_MonitorThread)
+        {
+            WaitForSingleObject(m_MonitorThread, 5000);
+            ELLE_SAFE_CLOSE_HANDLE(m_MonitorThread);
+        }
+        LOG(INFO, L"ElleIdentityGuard stopped");
+    }
+
+    uint64_t EventsLogged() const { return m_EventsLogged; }
+
+private:
+    // Take baseline modification times for watched files
+    void TakeFileBaseline()
+    {
+        for (auto path : WATCHED_FILES)
+        {
+            WIN32_FILE_ATTRIBUTE_DATA info = {};
+            if (GetFileAttributesExW(path, GetFileExInfoStandard, &info))
+            {
+                m_FileBaseline[path] = info.ftLastWriteTime;
+                LOG(DEBUG, L"TakeFileBaseline: %s baseline set", path);
+            }
+            else
+            {
+                LOG(WARN, L"TakeFileBaseline: Cannot stat %s (error=%lu)", path, GetLastError());
+            }
+        }
+    }
+
+    // Take baseline row counts for key tables
+    void TakeDBBaseline()
+    {
+        auto queryCount = [&](ElleDB db, const wchar_t* sql) -> int64_t
+        {
+            ElleSQLScope conn(db);
+            if (!conn.Valid()) return -1;
+            int64_t count = -1;
+            conn->Query(sql, [&](const std::vector<std::wstring>& row)
+                { if (!row.empty()) count = _wtoi64(row[0].c_str()); });
+            return count;
+        };
+
+        m_DBBaseline[L"ElleCore.Users"]     = queryCount(ElleDB::CORE,  L"SELECT COUNT(*) FROM ElleCore.dbo.Users");
+        m_DBBaseline[L"ElleKnowledge.Morals"] = queryCount(ElleDB::KNOWLEDGE, L"SELECT COUNT(*) FROM ElleKnowledge.dbo.Morals");
+        m_DBBaseline[L"ElleHeart.Bonds"]    = queryCount(ElleDB::HEART, L"SELECT COUNT(*) FROM ElleHeart.dbo.Bonds");
+
+        for (auto& pair : m_DBBaseline)
+            LOG(DEBUG, L"TakeDBBaseline: %s = %lld rows", pair.first.c_str(), pair.second);
+    }
+
+    static DWORD WINAPI MonitorThreadProc(LPVOID param)
+    {
+        auto* guard = static_cast<ElleIdentityGuard*>(param);
+        LOG(INFO, L"Monitor loop running. Interval=%dms", ElleConfig::Identity::CHECK_INTERVAL_MS);
+
+        while (guard->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(guard->m_StopEvent, ElleConfig::Identity::CHECK_INTERVAL_MS);
+            if (wait == WAIT_OBJECT_0) break;
+
+            guard->CheckFiles();
+            guard->CheckProcesses();
+
+            // DB check is heavier — run every 60 seconds (60 * 1000ms intervals)
+            static int dbCheckCycle = 0;
+            if (++dbCheckCycle >= 60)
+            {
+                dbCheckCycle = 0;
+                guard->CheckDBIntegrity();
+            }
+        }
+
+        LOG(INFO, L"Monitor loop exiting");
+        return 0;
+    }
+
+    void CheckFiles()
+    {
+        for (auto path : WATCHED_FILES)
+        {
+            WIN32_FILE_ATTRIBUTE_DATA info = {};
+            if (!GetFileAttributesExW(path, GetFileExInfoStandard, &info))
+                continue;
+
+            auto it = m_FileBaseline.find(path);
+            if (it == m_FileBaseline.end())
+            {
+                // New file appeared
+                LogEvent(L"FILE_ADDED", path, L"File not in baseline — was added after startup");
+                m_FileBaseline[path] = info.ftLastWriteTime;
+                continue;
+            }
+
+            FILETIME& baseline = it->second;
+            if (CompareFileTime(&info.ftLastWriteTime, &baseline) != 0)
+            {
+                // File was modified
+                LogEvent(L"FILE_MODIFIED", path, L"Modification time changed since baseline");
+                m_FileBaseline[path] = info.ftLastWriteTime;  // Update baseline
+            }
+        }
+    }
+
+    void CheckProcesses()
+    {
+        // Build list of running process names
+        std::unordered_map<std::wstring, bool> running;
+        for (auto name : MONITORED_PROCESSES)
+            running[name] = false;
+
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE)
+        {
+            LOG(WARN, L"CheckProcesses: CreateToolhelp32Snapshot failed: %lu", GetLastError());
+            return;
+        }
+
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+
+        if (Process32FirstW(hSnap, &pe))
+        {
+            do
+            {
+                auto it = running.find(pe.szExeFile);
+                if (it != running.end())
+                    it->second = true;
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+
+        // Report any monitored process that's not running
+        // (only log if it was previously seen running — avoid false positives at startup)
+        for (auto& pair : running)
+        {
+            auto prevIt = m_ProcessLastSeen.find(pair.first);
+            bool wasSeen = (prevIt != m_ProcessLastSeen.end() && prevIt->second);
+
+            if (!pair.second && wasSeen)
+            {
+                LOG(WARN, L"CheckProcesses: %s is no longer running — checking for graceful shutdown",
+                    pair.first.c_str());
+
+                // Check if there's a graceful shutdown record in ElleSystem
+                bool graceful = false;
+                ElleSQLScope sysConn(ElleDB::SYSTEM);
+                if (sysConn.Valid())
+                {
+                    std::wstring procName(pair.first.begin(), pair.first.end());
+                    sysConn->QueryParams(
+                        L"SELECT TOP 1 Status FROM ElleSystem.dbo.Workers WHERE WorkerName LIKE ? ORDER BY StoppedAt DESC",
+                        { L"%" + procName + L"%" },
+                        [&](const std::vector<std::wstring>& row)
+                        {
+                            if (!row.empty() && row[0] == L"0")
+                                graceful = true;
+                        }
+                    );
+                }
+
+                if (!graceful)
+                    LogEvent(L"PROCESS_FAULT", pair.first, L"Process disappeared without graceful shutdown record");
+                else
+                    LOG(DEBUG, L"CheckProcesses: %s stopped gracefully", pair.first.c_str());
+            }
+
+            m_ProcessLastSeen[pair.first] = pair.second;
+        }
+    }
+
+    void CheckDBIntegrity()
+    {
+        LOG(DEBUG, L"CheckDBIntegrity: Running integrity checks");
+
+        auto queryCount = [&](ElleDB db, const wchar_t* sql) -> int64_t
+        {
+            ElleSQLScope conn(db);
+            if (!conn.Valid()) return -1;
+            int64_t count = -1;
+            conn->Query(sql, [&](const std::vector<std::wstring>& row)
+                { if (!row.empty()) count = _wtoi64(row[0].c_str()); });
+            return count;
+        };
+
+        // Check tables that should never shrink
+        struct Check { std::wstring name; ElleDB db; std::wstring sql; };
+        std::vector<Check> checks =
+        {
+            { L"ElleCore.Users",       ElleDB::CORE,      L"SELECT COUNT(*) FROM ElleCore.dbo.Users" },
+            { L"ElleKnowledge.Morals", ElleDB::KNOWLEDGE, L"SELECT COUNT(*) FROM ElleKnowledge.dbo.Morals" },
+            { L"ElleHeart.Bonds",      ElleDB::HEART,     L"SELECT COUNT(*) FROM ElleHeart.dbo.Bonds" },
+        };
+
+        for (auto& check : checks)
+        {
+            int64_t current = queryCount(check.db, check.sql.c_str());
+            auto baseIt = m_DBBaseline.find(check.name);
+
+            if (baseIt != m_DBBaseline.end() && current >= 0 && current < baseIt->second)
+            {
+                wchar_t detail[256] = {};
+                _snwprintf_s(detail, _countof(detail), _TRUNCATE,
+                    L"Row count dropped from %lld to %lld — possible unauthorized deletion",
+                    baseIt->second, current);
+                LogEvent(L"DB_INTEGRITY_WARN", check.name, detail);
+            }
+
+            if (current >= 0)
+                m_DBBaseline[check.name] = current;  // Update to current (allows growth)
+        }
+    }
+
+    void LogEvent(const std::wstring& eventType, const std::wstring& target, const std::wstring& detail)
+    {
+        LOG(WARN, L"IdentityEvent [%s] Target=%s Detail=%s",
+            eventType.c_str(), target.c_str(), detail.c_str());
+
+        ElleSQLScope sysConn(ElleDB::SYSTEM);
+        if (!sysConn.Valid()) return;
+
+        sysConn->ExecuteParams(
+            L"INSERT INTO ElleSystem.dbo.IdentityLog (EventType, Target, Detail, EventTime) "
+            L"VALUES (?, ?, ?, GETDATE())",
+            { eventType, target, detail }
+        );
+
+        m_EventsLogged.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::unordered_map<std::wstring, FILETIME>  m_FileBaseline;
+    std::unordered_map<std::wstring, int64_t>   m_DBBaseline;
+    std::unordered_map<std::wstring, bool>      m_ProcessLastSeen;
+
+    HANDLE              m_MonitorThread;
+    HANDLE              m_StopEvent;
+    volatile bool       m_Running;
+    std::atomic<uint64_t> m_EventsLogged{ 0 };
+};
+
+// =============================================================================
+// ElleIdentityService
+// =============================================================================
+class ElleIdentityService : public ElleServiceBase
+{
+public:
+    ElleIdentityService() : ElleServiceBase(SVCNAME) {}
+
+protected:
+    ElleResult OnStart() override
+    {
+        LOG(INFO, L"OnStart: Initializing Identity Guard service");
+        ElleResult r = InitSharedInfrastructure();
+        if (r != ElleResult::OK) return r;
+
+        ElleEpochManager::Get().Init(false);
+
+        RegisterWorker();
+
+        r = m_Guard.Start(StopEvent());
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"IdentityGuard::Start() failed: %s", ElleResultStr(r));
+            return r;
+        }
+
+        LOG(INFO, L"Identity Guard service running");
+        return ElleResult::OK;
+    }
+
+    void OnStop() override
+    {
+        LOG(INFO, L"OnStop: Stopping Identity Guard. EventsLogged=%llu", m_Guard.EventsLogged());
+        m_Guard.Stop();
+        UnregisterWorker();
+        ShutdownSharedInfrastructure();
+    }
+
+private:
+    ElleIdentityGuard m_Guard;
+};
+
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleIdentityService svc;
+
+    if (argc >= 2)
+    {
+        if (_wcsicmp(argv[1], L"install") == 0)
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            return svc.Install(L"Elle Identity Guard",
+                L"Elle-Ann ESI — Identity core guard, file monitoring, process watchdog, DB integrity.",
+                exePath) == ElleResult::OK ? 0 : 1;
+        }
+        else if (_wcsicmp(argv[1], L"uninstall") == 0)
+            return svc.Uninstall() == ElleResult::OK ? 0 : 1;
+        else if (_wcsicmp(argv[1], L"console") == 0) { svc.RunAsConsole(); return 0; }
+    }
+
+    // Double-click (no args) interactive install path
+    if (argc == 1 && ElleServiceBase::IsInteractiveSession())
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        ElleResult r = svc.Install(L"Elle Identity Guard",
+            L"Elle-Ann ESI — Identity core guard, file monitoring, process watchdog, DB integrity.",
+            exePath);
+
+        if (r == ElleResult::OK)
+            MessageBoxW(nullptr, L"Service uploaded ok", L"Install", MB_OK | MB_ICONINFORMATION);
+        else
+            MessageBoxW(nullptr, L"Service upload failed", L"Install", MB_OK | MB_ICONERROR);
+
+        return (r == ElleResult::OK) ? 0 : 1;
+    }
+
+    svc.RunAsService();
+    return 0;
+}

@@ -1,0 +1,235 @@
+﻿// =============================================================================
+// Elle.Debug.EmotionViewer — main.cpp
+//
+// Live console view of Elle's 102-dimension emotional state.
+// Polls ElleMemory.EmotionalState every second and renders a text-mode
+// bar chart of the active dimensions.
+//
+// Usage:
+//   EmotionViewer.exe                   (live view, all dimensions > 0.05)
+//   EmotionViewer.exe all               (show all 102 dimensions)
+//   EmotionViewer.exe set <dimID> <val> (manually set a dimension value for testing)
+//   EmotionViewer.exe history           (print last 20 ElleSystem log entries for Emotional service)
+//   EmotionViewer.exe reset             (set all dimensions to 0.0)
+// =============================================================================
+
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleTypes.h"
+#include "../../Shared/ElleConfig.h"
+#include <cstdio>
+#include <cmath>
+#include <algorithm>
+
+// =============================================================================
+// Render a single dimension as a text bar
+// value: -1.0 to 1.0
+// bar width: 40 chars, center is 0.0
+// Positive values render as '█' going right, negative as '▒' going left
+// =============================================================================
+static void PrintDimensionBar(int id, const std::wstring& name, double value)
+{
+    const int BAR_HALF = 20;
+    const int BAR_TOTAL = BAR_HALF * 2 + 1;  // 41 chars including center marker
+
+    wchar_t bar[42] = {};
+    // Fill with spaces
+    for (int i = 0; i < BAR_TOTAL; i++) bar[i] = L' ';
+    bar[BAR_HALF] = L'|';  // Center marker
+
+    int filled = (int)round(fabs(value) * BAR_HALF);
+    if (value > 0.0)
+    {
+        for (int i = 0; i < filled && i < BAR_HALF; i++)
+            bar[BAR_HALF + 1 + i] = L'\u2588';  // █
+    }
+    else if (value < 0.0)
+    {
+        for (int i = 0; i < filled && i < BAR_HALF; i++)
+            bar[BAR_HALF - 1 - i] = L'\u2592';  // ▒
+    }
+    bar[BAR_TOTAL] = L'\0';
+
+    // Color coding by sign
+    // Positive: normal, Negative: dim, Near-zero: very dim
+    const wchar_t* sign = value > 0.005 ? L"+" : (value < -0.005 ? L"-" : L" ");
+
+    wprintf(L"  [%3d] %-20s  %s  [%s]  %s%.4f\n",
+        id,
+        name.size() > 20 ? name.substr(0, 20).c_str() : name.c_str(),
+        sign,
+        bar,
+        value >= 0 ? L" " : L"",
+        value
+    );
+}
+
+// =============================================================================
+// Print all active dimensions
+// =============================================================================
+static void PrintEmotionalState(bool showAll)
+{
+    system("cls");
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wprintf(L"=== ElleAnn Emotional Viewer  %02d:%02d:%02d ===\n",
+        now.wHour, now.wMinute, now.wSecond);
+    wprintf(L"  %-5s  %-20s  %-2s  [%-20s|%-20s]  Value\n",
+        L"[ID]", L"Name", L"S", L"  Negative  <---", L"--->  Positive  ");
+    wprintf(L"  %s\n", std::wstring(90, L'-').c_str());
+
+    ElleSQLScope memConn(ElleDB::MEMORY);
+    if (!memConn.Valid())
+    {
+        wprintf(L"[ERROR] Cannot connect to ElleMemory\n");
+        return;
+    }
+
+    int activeCount = 0;
+    double maxAbsValue = 0.0;
+    std::wstring dominantDim;
+
+    memConn->Query(
+        L"SELECT DimensionID, Name, Value FROM ElleMemory.dbo.EmotionalState ORDER BY DimensionID",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 3) return;
+            int    id    = _wtoi(row[0].c_str());
+            double value = _wtof(row[2].c_str());
+
+            bool active = fabs(value) > ElleConfig::Emotional::NEUTRAL_THRESHOLD;
+
+            if (fabs(value) > maxAbsValue)
+            {
+                maxAbsValue = fabs(value);
+                dominantDim = row[1];
+            }
+
+            if (showAll || active)
+            {
+                PrintDimensionBar(id, row[1], value);
+                if (active) activeCount++;
+            }
+        }
+    );
+
+    if (!showAll && activeCount == 0)
+        wprintf(L"  All dimensions within neutral threshold (%.2f). Elle is at rest.\n",
+            ElleConfig::Emotional::NEUTRAL_THRESHOLD);
+
+    wprintf(L"\n  Active dimensions: %d/%d",
+        activeCount, ElleConfig::Emotional::DIMENSION_COUNT);
+    if (!dominantDim.empty())
+        wprintf(L"  Dominant: %s (%.4f)", dominantDim.c_str(), maxAbsValue);
+
+    // Trust score
+    ElleSQLScope coreConn(ElleDB::CORE);
+    if (coreConn.Valid())
+    {
+        int trust = 0;
+        coreConn->Query(L"SELECT TOP 1 TrustScore FROM ElleCore.dbo.TrustState ORDER BY UpdatedAt DESC",
+            [&](const std::vector<std::wstring>& r) { if (!r.empty()) trust = _wtoi(r[0].c_str()); });
+        wprintf(L"  Trust: %d", trust);
+    }
+
+    wprintf(L"\n\n  'all' flag shows all 102 | Ctrl+C to exit\n");
+}
+
+// =============================================================================
+// main
+// =============================================================================
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleLogger::Get().Init(L"EmotionViewer",
+        ElleConfig::Log::TARGET_CONSOLE | ElleConfig::Log::TARGET_DEBUGGER,
+        ElleLogLevel::WARN, L"");
+
+    ElleSQLPool::Get().Init(ElleConfig::DB::SERVER);
+
+    if (argc >= 2)
+    {
+        std::wstring cmd = argv[1];
+
+        if (_wcsicmp(cmd.c_str(), L"set") == 0)
+        {
+            if (argc < 4)
+            {
+                wprintf(L"Usage: EmotionViewer.exe set <dimensionID> <value>\n");
+                return 1;
+            }
+            int    dimID = _wtoi(argv[2]);
+            double val   = _wtof(argv[3]);
+
+            // Clamp to [-1, 1]
+            val = max(-1.0, min(1.0, val));
+
+            ElleSQLScope memConn(ElleDB::MEMORY);
+            if (!memConn.Valid()) { wprintf(L"[ERROR] DB unavailable\n"); return 1; }
+
+            ElleResult r = memConn->ExecuteParams(
+                L"UPDATE ElleMemory.dbo.EmotionalState SET Value = ?, LastUpdated = GETDATE() WHERE DimensionID = ?",
+                { std::to_wstring(val), std::to_wstring(dimID) }
+            );
+
+            if (r == ElleResult::OK)
+                wprintf(L"[OK] Dimension %d set to %.4f\n", dimID, val);
+            else
+                wprintf(L"[ERROR] Update failed: %s\n", memConn->LastError.c_str());
+            return 0;
+        }
+        else if (_wcsicmp(cmd.c_str(), L"reset") == 0)
+        {
+            ElleSQLScope memConn(ElleDB::MEMORY);
+            if (!memConn.Valid()) { wprintf(L"[ERROR] DB unavailable\n"); return 1; }
+            memConn->Execute(
+                L"UPDATE ElleMemory.dbo.EmotionalState SET Value = 0.0, LastUpdated = GETDATE()");
+            wprintf(L"[OK] All dimensions reset to 0.0\n");
+            return 0;
+        }
+        else if (_wcsicmp(cmd.c_str(), L"history") == 0)
+        {
+            ElleSQLScope sysConn(ElleDB::SYSTEM);
+            if (!sysConn.Valid()) { wprintf(L"[ERROR] DB unavailable\n"); return 1; }
+
+            wprintf(L"\n=== Last 20 Emotional service log entries ===\n\n");
+            sysConn->Query(
+                L"SELECT TOP 20 Timestamp, Level, Message FROM ElleSystem.dbo.Logs "
+                L"WHERE ServiceName = 'ElleEmotional' ORDER BY LogID DESC",
+                [](const std::vector<std::wstring>& row)
+                {
+                    if (row.size() < 3) return;
+                    int level = _wtoi(row[1].c_str());
+                    static const wchar_t* levels[] = { L"TRACE", L"DEBUG", L"INFO ", L"WARN ", L"ERROR", L"FATAL" };
+                    wprintf(L"  %s [%s] %s\n",
+                        row[0].c_str(),
+                        (level >= 0 && level < 6) ? levels[level] : L"???  ",
+                        row[2].c_str());
+                }
+            );
+            return 0;
+        }
+
+        // 'all' flag — fall through to live view with showAll = true
+        bool showAll = (_wcsicmp(cmd.c_str(), L"all") == 0);
+
+        // One-shot print then exit
+        PrintEmotionalState(showAll);
+        wprintf(L"\n");
+        ElleSQLPool::Get().Shutdown();
+        ElleLogger::Get().Shutdown();
+        return 0;
+    }
+
+    // Live view mode — refresh every 1 second
+    SetConsoleCtrlHandler([](DWORD) -> BOOL { return TRUE; }, TRUE);
+    HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    while (WaitForSingleObject(stopEvent, 1000) == WAIT_TIMEOUT)
+        PrintEmotionalState(false);
+
+    ElleSQLPool::Get().Shutdown();
+    ElleLogger::Get().Shutdown();
+    CloseHandle(stopEvent);
+    return 0;
+}

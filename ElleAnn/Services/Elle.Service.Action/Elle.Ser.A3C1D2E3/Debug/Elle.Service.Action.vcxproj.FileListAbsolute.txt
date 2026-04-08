@@ -1,0 +1,3 @@
+C:\Elle\C++\ElleAnn\Services\Elle.Service.Action\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Services\Elle.Service.Action\Debug\ElleAnn.config
+C:\Elle\C++\ElleAnn\Services\Elle.Service.Action\Debug\Debug\lua54.dll

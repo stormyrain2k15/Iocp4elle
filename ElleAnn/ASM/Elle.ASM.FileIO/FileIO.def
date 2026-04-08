@@ -1,0 +1,9 @@
+; Elle.ASM.FileIO.def
+
+LIBRARY ElleASMFileIO
+
+EXPORTS
+    ElleWriteFile
+    ElleReadFile
+    ElleFileExists
+    ElleDeleteFile

@@ -1,0 +1,303 @@
+﻿// =============================================================================
+// Elle.Debug.ServiceHarness — main.cpp
+//
+// Runs any Elle service in-process without the Windows SCM.
+// Useful for attaching the debugger, watching threads, setting breakpoints,
+// and seeing log output in the VS Output window simultaneously.
+//
+// Usage:
+//   ServiceHarness.exe QueueWorker
+//   ServiceHarness.exe HTTP
+//   ServiceHarness.exe Emotional
+//   ServiceHarness.exe Memory
+//   ServiceHarness.exe Cognitive
+//   ServiceHarness.exe Action
+//   ServiceHarness.exe Identity
+//   ServiceHarness.exe Heartbeat
+//   ServiceHarness.exe ALL          (starts everything in sequence)
+//
+// Each service runs on its own thread. Ctrl+C stops all cleanly.
+// Log output goes to both file and VS Output/DebugView (TARGET_DEBUGGER forced on).
+// Prints a live status line every 5 seconds: uptime, thread counts, queue depths.
+// =============================================================================
+
+#include "../../Shared/ElleServiceBase.h"
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleQueueIPC.h"
+#include "../../Shared/ElleConfigReader.h"
+#include <vector>
+#include <map>
+
+#define HARNESS_LOG(lvl, fmt, ...) ELLE_LOG_##lvl(L"ServiceHarness", fmt, ##__VA_ARGS__)
+
+// Forward declarations of service wmain functions
+// In a real build these would be separate EXEs — here we link them all together
+// by including their Service.cpp files with renamed wmain symbols via #define tricks.
+// For the harness the cleaner approach is to re-implement OnStart/OnStop inline
+// using the same engine classes.
+
+// =============================================================================
+// HarnessStatus — live status for one running service
+// =============================================================================
+struct HarnessStatus
+{
+    std::wstring    ServiceName;
+    HANDLE          Thread;
+    DWORD           TID;
+    DWORD           StartedAt;      // GetTickCount() at launch
+    volatile bool   Running;
+    ElleResult      StartResult;
+};
+
+// =============================================================================
+// Global state
+// =============================================================================
+static std::vector<HarnessStatus*>  g_RunningServices;
+static HANDLE                       g_GlobalStopEvent = nullptr;
+static CRITICAL_SECTION             g_StatusCS;
+
+// =============================================================================
+// Status printer — prints a summary line every 5 seconds
+// =============================================================================
+static DWORD WINAPI StatusPrinterProc(LPVOID)
+{
+    while (WaitForSingleObject(g_GlobalStopEvent, 5000) == WAIT_TIMEOUT)
+    {
+        DWORD now = GetTickCount();
+
+        // Queue depths
+        int pendingIntents = 0, lockedActions = 0;
+        {
+            ElleSQLScope core(ElleDB::CORE);
+            if (core.Valid())
+            {
+                core->Query(L"SELECT COUNT(*) FROM ElleCore.dbo.IntentQueue WHERE StatusID = 0",
+                    [&](const std::vector<std::wstring>& r) { if (!r.empty()) pendingIntents = _wtoi(r[0].c_str()); });
+                core->Query(L"SELECT COUNT(*) FROM ElleCore.dbo.ActionQueue WHERE StatusID IN (0,1)",
+                    [&](const std::vector<std::wstring>& r) { if (!r.empty()) lockedActions = _wtoi(r[0].c_str()); });
+            }
+        }
+
+        wprintf(L"\n[Harness Status]\n");
+        EnterCriticalSection(&g_StatusCS);
+        for (auto* svc : g_RunningServices)
+        {
+            DWORD uptimeSec = (now - svc->StartedAt) / 1000;
+            wprintf(L"  %-25s  %s  uptime=%lus  TID=%lu\n",
+                svc->ServiceName.c_str(),
+                svc->Running ? L"RUNNING" : L"STOPPED",
+                uptimeSec,
+                svc->TID);
+        }
+        LeaveCriticalSection(&g_StatusCS);
+        wprintf(L"  IntentQueue.Pending=%d  ActionQueue.Active=%d\n", pendingIntents, lockedActions);
+    }
+    return 0;
+}
+
+// =============================================================================
+// Launch a service subprocess as a console-mode process
+// (ServiceHarness doesn't embed service code — it launches each exe in console mode)
+// =============================================================================
+static HarnessStatus* LaunchService(const std::wstring& serviceName, const std::wstring& exePath)
+{
+    auto* status = new HarnessStatus{};
+    status->ServiceName = serviceName;
+    status->Running     = false;
+    status->StartResult = ElleResult::ERR_GENERIC;
+    status->StartedAt   = GetTickCount();
+
+    // Launch the service EXE in console mode
+    struct Ctx { HarnessStatus* status; std::wstring exePath; };
+    auto* ctx = new Ctx{ status, exePath };
+
+    status->Thread = CreateThread(nullptr, 0,
+        [](LPVOID p) -> DWORD
+        {
+            auto* ctx = static_cast<Ctx*>(p);
+            HarnessStatus* s = ctx->status;
+            std::wstring exe = ctx->exePath;
+            delete ctx;
+
+            HARNESS_LOG(INFO, L"Launching: %s console", exe.c_str());
+
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+
+            std::wstring cmdLine = L"\"" + exe + L"\" console";
+
+            BOOL ok = CreateProcessW(
+                nullptr,
+                (LPWSTR)cmdLine.c_str(),
+                nullptr, nullptr,
+                FALSE,
+                CREATE_NEW_CONSOLE,
+                nullptr, nullptr,
+                &si, &pi
+            );
+
+            if (!ok)
+            {
+                HARNESS_LOG(ERROR, L"CreateProcess failed for %s: %lu", exe.c_str(), GetLastError());
+                s->StartResult = ElleResult::ERR_GENERIC;
+                return 1;
+            }
+
+            s->Running      = true;
+            s->TID          = pi.dwThreadId;
+            s->StartResult  = ElleResult::OK;
+
+            HARNESS_LOG(INFO, L"Launched %s PID=%lu", exe.c_str(), pi.dwProcessId);
+
+            // Wait for process to exit
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            s->Running = false;
+
+            DWORD exitCode = 0;
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+            HARNESS_LOG(INFO, L"%s exited with code %lu", exe.c_str(), exitCode);
+
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return 0;
+        },
+        ctx, 0, &status->TID);
+
+    if (!status->Thread)
+    {
+        HARNESS_LOG(ERROR, L"CreateThread for %s failed: %lu", serviceName.c_str(), GetLastError());
+        delete status;
+        return nullptr;
+    }
+
+    // Give the process a moment to start
+    Sleep(500);
+
+    EnterCriticalSection(&g_StatusCS);
+    g_RunningServices.push_back(status);
+    LeaveCriticalSection(&g_StatusCS);
+
+    return status;
+}
+
+// =============================================================================
+// main
+// =============================================================================
+int wmain(int argc, wchar_t* argv[])
+{
+    if (argc < 2)
+    {
+        wprintf(L"Usage: ServiceHarness.exe <ServiceName|ALL>\n");
+        wprintf(L"  Services: QueueWorker HTTP Emotional Memory Cognitive Action Identity Heartbeat\n");
+        return 1;
+    }
+
+    InitializeCriticalSection(&g_StatusCS);
+    g_GlobalStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    // Force debugger output on for harness sessions
+    ElleLogger::Get().Init(L"ServiceHarness",
+        ElleConfig::Log::TARGET_FILE | ElleConfig::Log::TARGET_DEBUGGER | ElleConfig::Log::TARGET_CONSOLE,
+        ElleLogLevel::TRACE,
+        L""
+    );
+
+    ElleConfigReader::Get().Load();
+
+    HARNESS_LOG(INFO, L"ServiceHarness starting. Target=%s", argv[1]);
+
+    // Initialize SQL pool so we can query status
+    ElleSQLPool::Get().Init(ElleConfigReader::Get().Server());
+
+    // Build the service map — name -> exe path
+    // Assumes all EXEs are in the same directory as ServiceHarness.exe
+    wchar_t exeDir[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exeDir, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(exeDir, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+
+    std::map<std::wstring, std::wstring> serviceMap =
+    {
+        { L"QueueWorker", std::wstring(exeDir) + L"ElleQueueWorker.exe" },
+        { L"HTTP",        std::wstring(exeDir) + L"ElleHTTP.exe" },
+        { L"Emotional",   std::wstring(exeDir) + L"ElleEmotional.exe" },
+        { L"Memory",      std::wstring(exeDir) + L"ElleMemory.exe" },
+        { L"Cognitive",   std::wstring(exeDir) + L"ElleCognitive.exe" },
+        { L"Action",      std::wstring(exeDir) + L"ElleAction.exe" },
+        { L"Identity",    std::wstring(exeDir) + L"ElleIdentity.exe" },
+        { L"Heartbeat",   std::wstring(exeDir) + L"ElleHeartbeat.exe" },
+    };
+
+    std::wstring target = argv[1];
+
+    if (_wcsicmp(target.c_str(), L"ALL") == 0)
+    {
+        // Ordered startup — QueueWorker first so the loop is active before other services push intents
+        std::vector<std::wstring> startOrder =
+            { L"QueueWorker", L"HTTP", L"Emotional", L"Memory",
+              L"Cognitive", L"Action", L"Identity", L"Heartbeat" };
+
+        for (auto& name : startOrder)
+        {
+            auto it = serviceMap.find(name);
+            if (it != serviceMap.end())
+            {
+                wprintf(L"[Harness] Launching %s...\n", name.c_str());
+                LaunchService(name, it->second);
+                Sleep(1000);  // Stagger launches
+            }
+        }
+    }
+    else
+    {
+        auto it = serviceMap.find(target);
+        if (it == serviceMap.end())
+        {
+            wprintf(L"[Harness] Unknown service: %s\n", target.c_str());
+            return 1;
+        }
+        LaunchService(target, it->second);
+    }
+
+    // Start the status printer
+    HANDLE hPrinter = CreateThread(nullptr, 0, StatusPrinterProc, nullptr, 0, nullptr);
+
+    // Ctrl+C handler
+    SetConsoleCtrlHandler([](DWORD) -> BOOL
+    {
+        wprintf(L"\n[Harness] Shutdown signal — stopping all services\n");
+        SetEvent(g_GlobalStopEvent);
+        return TRUE;
+    }, TRUE);
+
+    wprintf(L"[Harness] Running. Ctrl+C to stop all.\n\n");
+
+    // Wait for stop signal
+    WaitForSingleObject(g_GlobalStopEvent, INFINITE);
+
+    // Wait for all service threads to exit (they exit when their process exits)
+    wprintf(L"[Harness] Waiting for services to exit...\n");
+    EnterCriticalSection(&g_StatusCS);
+    std::vector<HANDLE> threads;
+    for (auto* svc : g_RunningServices)
+        if (svc->Thread) threads.push_back(svc->Thread);
+    LeaveCriticalSection(&g_StatusCS);
+
+    if (!threads.empty())
+        WaitForMultipleObjects((DWORD)threads.size(), threads.data(), TRUE, 15000);
+
+    if (hPrinter)
+    {
+        WaitForSingleObject(hPrinter, 2000);
+        CloseHandle(hPrinter);
+    }
+
+    HARNESS_LOG(INFO, L"ServiceHarness shutdown complete");
+    ElleLogger::Get().Shutdown();
+    ElleSQLPool::Get().Shutdown();
+    DeleteCriticalSection(&g_StatusCS);
+    CloseHandle(g_GlobalStopEvent);
+    return 0;
+}

@@ -1,0 +1,819 @@
+﻿// =============================================================================
+// ElleQueueIPC.cpp — Implementation
+// =============================================================================
+
+#include "ElleQueueIPC.h"
+#include "ElleEpoch.h"
+#include <unordered_map>
+
+// =============================================================================
+// Helper: parse a single ElleIntent from a SQL row
+// Row order: IntentID, TypeID, StatusID, IntentData, Response,
+//            CreatedAt, UpdatedAt, TrustRequired, Priority
+// =============================================================================
+static ElleIntent IntentFromRow(const std::vector<std::wstring>& row)
+{
+    ElleIntent intent = {};
+    if (row.size() < 9)
+        return intent;
+
+    intent.IntentID         = _wtoi64(row[0].c_str());
+    intent.Type             = static_cast<ElleIntentType>(_wtoi(row[1].c_str()));
+    intent.Status           = static_cast<ElleIntentStatus>(_wtoi(row[2].c_str()));
+    intent.IntentData       = row[3];
+    intent.Response         = row[4];
+    // CreatedAt / UpdatedAt stored as strings in SQL — store raw for now
+    intent.TrustRequired    = (DWORD)_wtoi(row[7].c_str());
+    intent.Priority         = _wtoi(row[8].c_str());
+    return intent;
+}
+
+// Helper: parse a single ElleAction from a SQL row
+// Row order: ActionID, SourceIntentID, TypeID, StatusID, ActionData,
+//            Result, CreatedAt, CompletedAt, TrustRequired, TimeoutMs
+static ElleAction ActionFromRow(const std::vector<std::wstring>& row)
+{
+    ElleAction action = {};
+    if (row.size() < 10)
+        return action;
+
+    action.ActionID         = _wtoi64(row[0].c_str());
+    action.SourceIntentID   = _wtoi64(row[1].c_str());
+    action.Type             = static_cast<ElleActionType>(_wtoi(row[2].c_str()));
+    action.Status           = static_cast<ElleActionStatus>(_wtoi(row[3].c_str()));
+    action.ActionData       = row[4];
+    action.Result           = row[5];
+    action.TrustRequired    = (DWORD)_wtoi(row[8].c_str());
+    action.TimeoutMs        = (DWORD)_wtoi(row[9].c_str());
+    return action;
+}
+
+// =============================================================================
+// ElleIntentQueue
+// =============================================================================
+ElleResult ElleIntentQueue::GetPendingIntents(
+    std::vector<ElleIntent>& outIntents,
+    int maxBatch)
+{
+    ELLE_LOG_TRACE(L"IntentQueue", L"GetPendingIntents maxBatch=%d", maxBatch);
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    // sp_GetPendingIntents atomically claims up to @MaxBatch intents
+    // by setting their status to PROCESSING and returning them.
+    std::vector<std::pair<std::wstring, std::wstring>> params =
+    {
+        { L"@MaxBatch", std::to_wstring(maxBatch) }
+    };
+
+    outIntents.clear();
+    ElleResult r = conn->ExecProc(L"sp_GetPendingIntents", params);
+
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+    {
+        ELLE_LOG_TRACE(L"IntentQueue", L"No pending intents");
+        return ElleResult::ERR_QUEUE_EMPTY;
+    }
+
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_ERROR(L"IntentQueue", L"sp_GetPendingIntents failed: %s", conn->LastError.c_str());
+        return r;
+    }
+
+    // Re-query to get the claimed rows (proc returns them as a result set)
+    // Use plain Query() here — zero rows claimed is a valid outcome (another worker
+    // grabbed all pending intents between our proc call and this read). That is not
+    // an error; it is normal concurrent operation. ERR_QUEUE_EMPTY is a semantic
+    // signal to the poll loop, not an I/O failure.
+    int claimedCount = 0;
+    r = conn->QueryRows(
+        L"SELECT IntentID, TypeID, StatusID, IntentData, Response, "
+        L"CreatedAt, UpdatedAt, TrustRequired, Priority "
+        L"FROM ElleCore.dbo.IntentQueue "
+        L"WHERE StatusID = 1 AND ClaimedByThread = @@SPID "
+        L"ORDER BY Priority DESC, CreatedAt ASC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            outIntents.push_back(IntentFromRow(row));
+        },
+        claimedCount
+    );
+
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+        r = ElleResult::OK;  // Zero claimed is normal, not an error
+
+    ELLE_LOG_DEBUG(L"IntentQueue", L"GetPendingIntents claimed %zu intents", outIntents.size());
+    return outIntents.empty() ? ElleResult::ERR_QUEUE_EMPTY : ElleResult::OK;
+}
+
+ElleResult ElleIntentQueue::SubmitIntentResponse(
+    int64_t intentID,
+    ElleIntentStatus status,
+    const std::wstring& responseJson)
+{
+    ELLE_LOG_DEBUG(L"IntentQueue", L"SubmitIntentResponse IntentID=%lld Status=%d",
+        intentID, static_cast<int>(status));
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    // sp_SubmitIntentResponse now SELECTs the updated row back as its last result
+    // set so we get both the affected count and the persisted values in one
+    // round-trip. No separate verification read needed.
+    std::vector<std::pair<std::wstring, std::wstring>> params =
+    {
+        { L"@IntentID",     std::to_wstring(intentID) },
+        { L"@StatusID",     std::to_wstring(static_cast<int>(status)) },
+        { L"@Response",     responseJson }
+    };
+
+    ElleSQLResult result;
+    int verifiedStatus   = -1;
+    std::wstring verifiedResponse;
+    bool rowReturned     = false;
+
+    ElleResult r = conn->ExecProcStructured(
+        L"sp_SubmitIntentResponse",
+        params,
+        result,
+        [&](const std::vector<std::wstring>& row)
+        {
+            // Row layout from proc: IntentID, StatusID, Response, UpdatedAt
+            if (row.size() >= 3)
+            {
+                verifiedStatus   = _wtoi(row[1].c_str());
+                verifiedResponse = row[2];
+                rowReturned      = true;
+            }
+        }
+    );
+
+    // Write succeeded check — proc executed and affected rows > 0
+    if (r != ElleResult::OK || !result.WriteSucceeded)
+    {
+        ELLE_LOG_ERROR(L"IntentQueue",
+            L"SubmitIntentResponse WRITE FAILED: IntentID=%lld RowsAffected=%d Error=%s",
+            intentID, result.RowsAffected, result.ErrorDetail.c_str());
+        return (r != ElleResult::OK) ? r : ElleResult::ERR_SQL_QUERY;
+    }
+
+    // Write verified check — confirm every field we wrote is what the DB now holds
+    if (!rowReturned)
+    {
+        ELLE_LOG_ERROR(L"IntentQueue",
+            L"SubmitIntentResponse WRITE UNVERIFIED: IntentID=%lld — proc returned no row. "
+            L"Write may have committed but persistence cannot be confirmed.", intentID);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (verifiedStatus != static_cast<int>(status))
+    {
+        ELLE_LOG_ERROR(L"IntentQueue",
+            L"SubmitIntentResponse WRITE UNVERIFIED: IntentID=%lld StatusID mismatch — "
+            L"wrote %d, DB has %d",
+            intentID, static_cast<int>(status), verifiedStatus);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    // Response field verification: if a non-empty response was written,
+    // confirm it landed. Empty responses are not verified (no-op writes).
+    if (!responseJson.empty() && verifiedResponse != responseJson)
+    {
+        ELLE_LOG_ERROR(L"IntentQueue",
+            L"SubmitIntentResponse WRITE UNVERIFIED: IntentID=%lld Response mismatch — "
+            L"wrote %zu chars, DB has %zu chars",
+            intentID, responseJson.size(), verifiedResponse.size());
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    result.WriteVerified = true;
+    ELLE_LOG_DEBUG(L"IntentQueue",
+        L"IntentID=%lld write succeeded and verified. status=%d response_len=%zu",
+        intentID, verifiedStatus, verifiedResponse.size());
+    return ElleResult::OK;
+}
+
+ElleResult ElleIntentQueue::MarkIntentStale(int64_t intentID)
+{
+    ELLE_LOG_WARN(L"IntentQueue", L"Marking IntentID=%lld as STALE", intentID);
+    return SubmitIntentResponse(intentID, ElleIntentStatus::STALE, L"{\"reason\":\"timeout\"}");
+}
+
+ElleResult ElleIntentQueue::PurgeStaleIntents(int& outPurged)
+{
+    ELLE_LOG_DEBUG(L"IntentQueue", L"PurgeStaleIntents timeout=%d sec",
+        ElleConfig::Queue::INTENT_STALE_TIMEOUT_SEC);
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    outPurged = 0;
+
+    wchar_t sql[512] = {};
+    _snwprintf_s(sql, _countof(sql), _TRUNCATE,
+        L"UPDATE ElleCore.dbo.IntentQueue "
+        L"SET StatusID = %d, UpdatedAt = GETDATE() "
+        L"WHERE StatusID IN (%d, %d) "
+        L"AND DATEDIFF(SECOND, CreatedAt, GETDATE()) > %d",
+        static_cast<int>(ElleIntentStatus::STALE),
+        static_cast<int>(ElleIntentStatus::PENDING),
+        static_cast<int>(ElleIntentStatus::PROCESSING),
+        ElleConfig::Queue::INTENT_STALE_TIMEOUT_SEC
+    );
+
+    // Fix: capture @@ROWCOUNT in the same batch as the UPDATE.
+    // A separate SELECT @@ROWCOUNT call returns the row count of the SELECT
+    // itself (1), not the UPDATE. DECLARE/@affected keeps it in one batch.
+    wchar_t batchSql[768] = {};
+    _snwprintf_s(batchSql, _countof(batchSql), _TRUNCATE,
+        L"DECLARE @affected INT; "
+        L"%s; "
+        L"SET @affected = @@ROWCOUNT; "
+        L"SELECT @affected;",
+        sql
+    );
+
+    int rowCount = 0;
+    ElleResult r = conn->QueryRows(batchSql,
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (!row.empty() && !row[0].empty())
+                outPurged = _wtoi(row[0].c_str());
+        },
+        rowCount
+    );
+
+    // QueryRows returns ERR_SQL_NO_DATA if the SELECT returned no rows —
+    // that can't happen here (SELECT @affected always returns one row),
+    // but treat it as OK with zero purged if it somehow does.
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+        r = ElleResult::OK;
+
+    if (outPurged > 0)
+        ELLE_LOG_WARN(L"IntentQueue", L"Purged %d stale intents", outPurged);
+
+    return r;
+}
+
+ElleResult ElleIntentQueue::GetPendingCount(int& outCount)
+{
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    outCount = 0;
+    ElleResult r = conn->Query(
+        L"SELECT COUNT(*) FROM ElleCore.dbo.IntentQueue WHERE StatusID = 0",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (!row.empty())
+                outCount = _wtoi(row[0].c_str());
+        });
+
+    ELLE_LOG_TRACE(L"IntentQueue", L"PendingCount=%d", outCount);
+    return r;
+}
+
+// =============================================================================
+// ElleActionQueue
+// =============================================================================
+ElleResult ElleActionQueue::CreateAction(
+    ElleActionType      type,
+    int64_t             sourceIntentID,
+    const std::wstring& actionDataJson,
+    DWORD               trustRequired,
+    DWORD               timeoutMs,
+    int64_t&            outActionID,
+    const std::wstring& causalChainIDFromParent)
+{
+    ELLE_LOG_DEBUG(L"ActionQueue", L"CreateAction Type=%d SourceIntent=%lld TrustReq=%lu Epoch=%s",
+        static_cast<int>(type), sourceIntentID, trustRequired,
+        ElleEpochManager::Get().CurrentEpoch().c_str());
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    outActionID = 0;
+
+    // Inherit epoch and causal chain from the parent intent.
+    // If no parent intent exists (sourceIntentID == 0), generate a new causal chain.
+    const std::wstring& epoch = ElleEpochManager::Get().CurrentEpoch();
+
+    std::wstring causalChainID;
+    if (sourceIntentID > 0 && !causalChainIDFromParent.empty())
+        causalChainID = causalChainIDFromParent;
+    else
+        causalChainID = ElleEpochManager::GenerateGUID();
+
+    std::vector<std::pair<std::wstring, std::wstring>> params =
+    {
+        { L"@TypeID",           std::to_wstring(static_cast<int>(type)) },
+        { L"@SourceIntentID",   std::to_wstring(sourceIntentID) },
+        { L"@ActionData",       actionDataJson },
+        { L"@TrustRequired",    std::to_wstring(trustRequired) },
+        { L"@TimeoutMs",        std::to_wstring(timeoutMs) },
+        { L"@EpochID",          epoch },
+        { L"@CausalChainID",    causalChainID }
+    };
+
+    // sp_ExecuteAction returns two result sets in the same round-trip:
+    //   Result set 1 (RowsAffected): how many rows the INSERT affected.
+    //   Result set 2 (inserted row): ActionID, TypeID, StatusID, TrustRequired, CreatedAt.
+    //
+    // ActionID comes from result set 2 — from the row the server just wrote,
+    // read back in the same call. No SCOPE_IDENTITY() on a separate round-trip,
+    // no dependency on connection identity, no window for another statement to
+    // reset SCOPE_IDENTITY before we read it.
+    ElleSQLResult sqlResult;
+    int64_t insertedActionID    = 0;
+    int     insertedTypeID      = -1;
+    int     insertedStatusID    = -1;
+    bool    rowReturned         = false;
+
+    ElleResult r = conn->ExecProcStructured(
+        L"sp_ExecuteAction",
+        params,
+        sqlResult,
+        [&](const std::vector<std::wstring>& row)
+        {
+            // Row layout: ActionID, TypeID, StatusID, TrustRequired, CreatedAt
+            if (row.size() >= 3)
+            {
+                insertedActionID  = _wtoi64(row[0].c_str());
+                insertedTypeID    = _wtoi(row[1].c_str());
+                insertedStatusID  = _wtoi(row[2].c_str());
+                rowReturned       = true;
+            }
+        }
+    );
+
+    // Write succeeded check: proc executed and RowsAffected == 1
+    if (r != ElleResult::OK || !sqlResult.WriteSucceeded)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"CreateAction WRITE FAILED: Type=%d SourceIntent=%lld RowsAffected=%d Error=%s",
+            static_cast<int>(type), sourceIntentID,
+            sqlResult.RowsAffected, sqlResult.ErrorDetail.c_str());
+        return (r != ElleResult::OK) ? r : ElleResult::ERR_SQL_QUERY;
+    }
+
+    // Write verified check: the row exists and the fields match what we sent
+    if (!rowReturned || insertedActionID == 0)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"CreateAction WRITE UNVERIFIED: proc returned no row or ActionID=0. "
+            L"RowsAffected=%d — INSERT may not have committed.",
+            sqlResult.RowsAffected);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (insertedTypeID != static_cast<int>(type))
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"CreateAction WRITE UNVERIFIED: ActionID=%lld TypeID mismatch — "
+            L"sent %d, DB has %d",
+            insertedActionID, static_cast<int>(type), insertedTypeID);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (insertedStatusID != static_cast<int>(ElleActionStatus::PENDING))
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"CreateAction WRITE UNVERIFIED: ActionID=%lld initial StatusID is %d, expected %d (PENDING)",
+            insertedActionID, insertedStatusID, static_cast<int>(ElleActionStatus::PENDING));
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    outActionID = insertedActionID;
+    ELLE_LOG_DEBUG(L"ActionQueue", L"CreateAction verified: ActionID=%lld Type=%d Status=PENDING",
+        outActionID, static_cast<int>(type));
+    return ElleResult::OK;
+}
+
+ElleResult ElleActionQueue::GetPendingActions(
+    std::vector<ElleAction>& outActions,
+    int maxBatch)
+{
+    ELLE_LOG_TRACE(L"ActionQueue", L"GetPendingActions maxBatch=%d", maxBatch);
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    std::vector<std::pair<std::wstring, std::wstring>> params =
+    {
+        { L"@MaxBatch", std::to_wstring(maxBatch) }
+    };
+
+    outActions.clear();
+    ElleResult r = conn->ExecProc(L"sp_GetPendingActions", params);
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+        return ElleResult::ERR_QUEUE_EMPTY;
+
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue", L"sp_GetPendingActions failed: %s", conn->LastError.c_str());
+        return r;
+    }
+
+    int claimedActions = 0;
+    r = conn->QueryRows(
+        L"SELECT ActionID, SourceIntentID, TypeID, StatusID, ActionData, "
+        L"Result, CreatedAt, CompletedAt, TrustRequired, TimeoutMs "
+        L"FROM ElleCore.dbo.ActionQueue "
+        L"WHERE StatusID = 1 AND ClaimedByThread = @@SPID "
+        L"ORDER BY CreatedAt ASC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            outActions.push_back(ActionFromRow(row));
+        },
+        claimedActions
+    );
+
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+        r = ElleResult::OK;
+
+    ELLE_LOG_DEBUG(L"ActionQueue", L"GetPendingActions claimed %zu actions", outActions.size());
+    return outActions.empty() ? ElleResult::ERR_QUEUE_EMPTY : ElleResult::OK;
+}
+
+ElleResult ElleActionQueue::SubmitActionResult(
+    int64_t actionID,
+    ElleActionStatus status,
+    const std::wstring& resultJson)
+{
+    ELLE_LOG_DEBUG(L"ActionQueue", L"SubmitActionResult ActionID=%lld Status=%d",
+        actionID, static_cast<int>(status));
+
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    std::vector<std::pair<std::wstring, std::wstring>> params =
+    {
+        { L"@ActionID",     std::to_wstring(actionID) },
+        { L"@StatusID",     std::to_wstring(static_cast<int>(status)) },
+        { L"@Result",       resultJson }
+    };
+
+    // sp_SubmitActionResult SELECTs the updated row back so we verify all
+    // written fields — StatusID, Result, and CompletedAt — in one round-trip.
+    ElleSQLResult sqlResult;
+    int   verifiedStatus    = -1;
+    bool  completedAtSet    = false;
+    bool  rowReturned       = false;
+    std::wstring verifiedResult;
+
+    ElleResult r = conn->ExecProcStructured(
+        L"sp_SubmitActionResult",
+        params,
+        sqlResult,
+        [&](const std::vector<std::wstring>& row)
+        {
+            // Row layout from proc: ActionID, StatusID, Result, CompletedAt
+            if (row.size() >= 4)
+            {
+                verifiedStatus   = _wtoi(row[1].c_str());
+                verifiedResult   = row[2];
+                completedAtSet   = !row[3].empty();  // CompletedAt must be non-null
+                rowReturned      = true;
+            }
+        }
+    );
+
+    if (r != ElleResult::OK || !sqlResult.WriteSucceeded)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"SubmitActionResult WRITE FAILED: ActionID=%lld RowsAffected=%d Error=%s",
+            actionID, sqlResult.RowsAffected, sqlResult.ErrorDetail.c_str());
+        return (r != ElleResult::OK) ? r : ElleResult::ERR_SQL_QUERY;
+    }
+
+    if (!rowReturned)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"SubmitActionResult WRITE UNVERIFIED: ActionID=%lld — proc returned no row",
+            actionID);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (verifiedStatus != static_cast<int>(status))
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"SubmitActionResult WRITE UNVERIFIED: ActionID=%lld StatusID mismatch — "
+            L"wrote %d, DB has %d",
+            actionID, static_cast<int>(status), verifiedStatus);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (!completedAtSet)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"SubmitActionResult WRITE UNVERIFIED: ActionID=%lld CompletedAt is NULL — "
+            L"UPDATE ran but timestamp did not commit",
+            actionID);
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    if (!resultJson.empty() && verifiedResult != resultJson)
+    {
+        ELLE_LOG_ERROR(L"ActionQueue",
+            L"SubmitActionResult WRITE UNVERIFIED: ActionID=%lld Result mismatch — "
+            L"wrote %zu chars, DB has %zu chars",
+            actionID, resultJson.size(), verifiedResult.size());
+        return ElleResult::ERR_SQL_WRITE_UNVERIFIED;
+    }
+
+    sqlResult.WriteVerified = true;
+    ELLE_LOG_DEBUG(L"ActionQueue",
+        L"ActionID=%lld write succeeded and verified. status=%d result_len=%zu completedAt=%s",
+        actionID, verifiedStatus, verifiedResult.size(), completedAtSet ? L"SET" : L"NULL");
+    return ElleResult::OK;
+}
+
+ElleResult ElleActionQueue::PurgeOldResults(int& outPurged)
+{
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    outPurged = 0;
+
+    wchar_t sql[512] = {};
+    _snwprintf_s(sql, _countof(sql), _TRUNCATE,
+        L"DELETE FROM ElleCore.dbo.ActionQueue "
+        L"WHERE StatusID IN (%d, %d) "
+        L"AND DATEDIFF(SECOND, CompletedAt, GETDATE()) > %d",
+        static_cast<int>(ElleActionStatus::SUCCESS),
+        static_cast<int>(ElleActionStatus::FAILED),
+        ElleConfig::Queue::ACTION_RESULT_RETAIN_SEC
+    );
+
+    wchar_t batchSql[768] = {};
+    _snwprintf_s(batchSql, _countof(batchSql), _TRUNCATE,
+        L"DECLARE @affected INT; "
+        L"%s; "
+        L"SET @affected = @@ROWCOUNT; "
+        L"SELECT @affected;",
+        sql
+    );
+
+    int rowCount = 0;
+    ElleResult r = conn->QueryRows(batchSql,
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (!row.empty() && !row[0].empty())
+                outPurged = _wtoi(row[0].c_str());
+        },
+        rowCount
+    );
+
+    if (r == ElleResult::ERR_SQL_NO_DATA)
+        r = ElleResult::OK;
+
+    if (outPurged > 0)
+        ELLE_LOG_DEBUG(L"ActionQueue", L"Purged %d old action results", outPurged);
+
+    return r;
+}
+
+ElleResult ElleActionQueue::GetLockedCount(int& outCount)
+{
+    ElleSQLScope conn(ElleDB::CORE);
+    if (!conn.Valid())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    outCount = 0;
+    conn->Query(
+        L"SELECT COUNT(*) FROM ElleCore.dbo.ActionQueue WHERE StatusID = 1",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (!row.empty()) outCount = _wtoi(row[0].c_str());
+        });
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// ElleQueueWorker
+// =============================================================================
+ElleQueueWorker::ElleQueueWorker()
+    : m_Thread(nullptr)
+    , m_StopEvent(nullptr)
+    , m_Running(false)
+    , m_IntentsProcessed(0)
+    , m_IntentsFailed(0)
+{
+}
+
+ElleQueueWorker::~ElleQueueWorker()
+{
+    Stop();
+}
+
+void ElleQueueWorker::RegisterIntentHandler(ElleIntentType type, ElleIntentHandler handler)
+{
+    std::lock_guard<std::mutex> lock(m_RegistryMutex);
+    m_IntentHandlers[static_cast<int>(type)] = handler;
+    ELLE_LOG_DEBUG(L"QueueWorker", L"Registered intent handler for type=%d", static_cast<int>(type));
+}
+
+
+
+ElleResult ElleQueueWorker::Start()
+{
+    ELLE_LOG_INFO(L"QueueWorker", L"Starting poll loop. PollInterval=%dms", ElleConfig::Queue::POLL_INTERVAL_MS);
+
+    m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!m_StopEvent)
+    {
+        ELLE_LOG_WIN32(L"QueueWorker", L"CreateEvent(StopEvent) failed", GetLastError());
+        return ElleResult::ERR_GENERIC;
+    }
+
+    m_Running = true;
+    m_Thread = CreateThread(nullptr, 0, WorkerThreadProc, this, 0, nullptr);
+    if (!m_Thread)
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"CreateThread failed: %u", GetLastError());
+        ElleLogger::Get().WriteWin32Error(ElleLogLevel::ERROR, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf, GetLastError());
+        m_Running = false;
+        CloseHandle(m_StopEvent);
+        m_StopEvent = nullptr;
+        return ElleResult::ERR_GENERIC;
+    }
+
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Poll loop started. TID=%lu", GetThreadId(m_Thread));
+        ElleLogger::Get().Write(ElleLogLevel::INFO, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+    return ElleResult::OK;
+}
+
+void ElleQueueWorker::Stop()
+{
+    if (!m_Running)
+        return;
+
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Stopping poll loop. Intents=%llu IntentFail=%llu",
+            m_IntentsProcessed.load(), m_IntentsFailed.load());
+        ElleLogger::Get().Write(ElleLogLevel::INFO, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    m_Running = false;
+
+    if (m_StopEvent)
+        SetEvent(m_StopEvent);
+
+    if (m_Thread)
+    {
+        DWORD waitResult = WaitForSingleObject(m_Thread, 10000);  // 10 second graceful shutdown
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            wchar_t _elle_log_buf[256] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Worker thread did not exit in 10s — terminating");
+            ElleLogger::Get().Write(ElleLogLevel::WARN, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+            TerminateThread(m_Thread, 1);
+        }
+        ELLE_SAFE_CLOSE_HANDLE(m_Thread);
+    }
+
+    ELLE_SAFE_CLOSE_HANDLE(m_StopEvent);
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Poll loop stopped");
+        ElleLogger::Get().Write(ElleLogLevel::INFO, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+}
+
+DWORD WINAPI ElleQueueWorker::WorkerThreadProc(LPVOID lpParam)
+{
+    ElleQueueWorker* self = static_cast<ElleQueueWorker*>(lpParam);
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Worker thread running. TID=%lu", GetCurrentThreadId());
+        ElleLogger::Get().Write(ElleLogLevel::INFO, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    while (self->m_Running)
+    {
+        self->PollCycle();
+
+        // Wait for poll interval or stop signal, whichever comes first
+        DWORD waitResult = WaitForSingleObject(self->m_StopEvent, ElleConfig::Queue::POLL_INTERVAL_MS);
+        if (waitResult == WAIT_OBJECT_0)
+            break;  // Stop was signaled
+    }
+
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Worker thread exiting");
+        ElleLogger::Get().Write(ElleLogLevel::INFO, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+    return 0;
+}
+
+void ElleQueueWorker::PollCycle()
+{
+    // Intent poll only. ActionQueue is consumed exclusively by Elle.Service.Action.
+    // QueueWorker never touches ActionQueue rows. Intent handlers call
+    // CreateAction() to enqueue work, but do not execute it.
+    std::vector<ElleIntent> intents;
+    ElleResult r = m_IntentQueue.GetPendingIntents(intents, ElleConfig::Queue::MAX_BATCH_SIZE);
+
+    if (r == ElleResult::OK && !intents.empty())
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"PollCycle: processing %zu intents", intents.size());
+        ElleLogger::Get().Write(ElleLogLevel::DEBUG, L"QueueWorker", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+        for (auto& intent : intents)
+            ProcessIntent(intent);
+    }
+
+    // Periodic stale intent cleanup (~every 50 seconds at default poll rate)
+    static DWORD cleanupCounter = 0;
+    if (++cleanupCounter >= 100)
+    {
+        cleanupCounter = 0;
+        int purged = 0;
+        m_IntentQueue.PurgeStaleIntents(purged);
+    }
+}
+
+void ElleQueueWorker::ProcessIntent(const ElleIntent& intent)
+{
+    ELLE_LOG_INFO(L"QueueWorker", L"Processing IntentID=%lld Type=%d Priority=%d",
+        intent.IntentID, static_cast<int>(intent.Type), intent.Priority);
+
+    // Look up registered handler
+    ElleIntentHandler handler;
+    {
+        std::lock_guard<std::mutex> lock(m_RegistryMutex);
+        auto it = m_IntentHandlers.find(static_cast<int>(intent.Type));
+        if (it != m_IntentHandlers.end())
+            handler = it->second;
+    }
+
+    std::wstring responseJson;
+    ElleResult handlerResult;
+
+    if (handler)
+    {
+        handlerResult = handler(intent, responseJson);
+        if (handlerResult == ElleResult::OK)
+        {
+            m_IntentsProcessed.fetch_add(1, std::memory_order_relaxed);
+            ELLE_LOG_INFO(L"QueueWorker", L"IntentID=%lld completed OK", intent.IntentID);
+        }
+        else
+        {
+            m_IntentsFailed.fetch_add(1, std::memory_order_relaxed);
+            ELLE_LOG_WARN(L"QueueWorker", L"IntentID=%lld handler returned %s",
+                intent.IntentID, ElleResultStr(handlerResult));
+
+            if (responseJson.empty())
+            {
+                wchar_t errBuf[256] = {};
+                _snwprintf_s(errBuf, _countof(errBuf), _TRUNCATE,
+                    L"{\"error\":\"%s\"}", ElleResultStr(handlerResult));
+                responseJson = errBuf;
+            }
+        }
+    }
+    else
+    {
+        // No handler registered — log and mark failed so C++ core knows
+        ELLE_LOG_WARN(L"QueueWorker", L"IntentID=%lld — no handler registered for Type=%d",
+            intent.IntentID, static_cast<int>(intent.Type));
+        handlerResult = ElleResult::ERR_INTENT_UNSUPPORTED;
+        responseJson = L"{\"error\":\"no_handler\"}";
+        m_IntentsFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Write result back — this is what Python was failing to do
+    ElleIntentStatus closeStatus = (handlerResult == ElleResult::OK)
+        ? ElleIntentStatus::COMPLETED
+        : ElleIntentStatus::FAILED;
+
+    ElleResult closeResult = m_IntentQueue.SubmitIntentResponse(
+        intent.IntentID, closeStatus, responseJson);
+
+    if (closeResult != ElleResult::OK)
+    {
+        ELLE_LOG_ERROR(L"QueueWorker", L"CRITICAL: Failed to submit response for IntentID=%lld — "
+            L"C++ core will not receive result and trust score will not update", intent.IntentID);
+    }
+}
+
+// ExecuteAction removed: Elle.Service.Action is the sole ActionQueue consumer.
+// QueueWorker processes intents only. Handlers call CreateAction() to enqueue
+// capability work. They never execute actions directly.

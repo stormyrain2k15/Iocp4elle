@@ -1,0 +1,175 @@
+﻿#pragma once
+// =============================================================================
+// ElleQueueIPC.h — IntentQueue / ActionQueue IPC for the Elle-Ann ESI Platform
+//
+// This is the broken spine. The C++ core pushes intents to IntentQueue and
+// expects to read results from ActionQueue. The new service layer polls
+// IntentQueue, processes intents, creates actions, executes them, and writes
+// results back through ActionQueue. This file provides the correct interface
+// for both sides of that loop.
+//
+// All calls go through the stored procedures that already exist in ElleCore:
+//   sp_GetPendingIntents       — poll for new intents to process
+//   sp_SubmitIntentResponse    — write result back after processing an intent
+//   sp_GetPendingActions       — poll for actions waiting for execution
+//   sp_SubmitActionResult      — write execution result back to ActionQueue
+//   sp_RequestIntent           — C++ core uses this to push a new intent
+//   sp_ExecuteAction           — creates an action record in ActionQueue
+// =============================================================================
+
+#include "ElleTypes.h"
+#include "ElleSQLConn.h"
+#include <vector>
+#include <functional>
+
+// =============================================================================
+// ElleIntentQueue — poll and respond to intents from the C++ core
+// =============================================================================
+class ElleIntentQueue
+{
+    ELLE_NONCOPYABLE(ElleIntentQueue)
+public:
+    ElleIntentQueue() = default;
+
+    // Fetch up to maxBatch pending intents from IntentQueue in priority order.
+    // Sets their status to PROCESSING atomically (so concurrent workers don't
+    // double-claim the same intent).
+    // Returns ERR_QUEUE_EMPTY if no pending intents available.
+    ElleResult GetPendingIntents(
+        std::vector<ElleIntent>& outIntents,
+        int maxBatch = ElleConfig::Queue::MAX_BATCH_SIZE
+    );
+
+    // Submit the completed result for a processed intent.
+    // Updates status to COMPLETED or FAILED and writes response payload.
+    // Also triggers trust score adjustment on the C++ core side.
+    ElleResult SubmitIntentResponse(
+        int64_t         intentID,
+        ElleIntentStatus status,
+        const std::wstring& responseJson
+    );
+
+    // Mark an intent as stale (exceeded timeout without being processed).
+    // The C++ core is responsible for deciding what to do with stale intents.
+    ElleResult MarkIntentStale(int64_t intentID);
+
+    // Purge all intents older than ElleConfig::Queue::INTENT_STALE_TIMEOUT_SEC
+    // that are still in PENDING or PROCESSING state.
+    // Returns count of purged intents in outPurged.
+    ElleResult PurgeStaleIntents(int& outPurged);
+
+    // Get the count of pending intents in queue right now (for monitoring)
+    ElleResult GetPendingCount(int& outCount);
+};
+
+// =============================================================================
+// ElleActionQueue — create and resolve actions spawned from intent processing
+// =============================================================================
+class ElleActionQueue
+{
+    ELLE_NONCOPYABLE(ElleActionQueue)
+public:
+    ElleActionQueue() = default;
+
+    // Create a new action record in ActionQueue.
+    // Called by intent handlers to queue capability execution.
+    // outActionID receives the verified newly created action's ID.
+    // causalChainIDFromParent: pass the parent intent's CausalChainID so the
+    // action inherits it. Leave empty to generate a new causal chain.
+    ElleResult CreateAction(
+        ElleActionType      type,
+        int64_t             sourceIntentID,
+        const std::wstring& actionDataJson,
+        DWORD               trustRequired,
+        DWORD               timeoutMs,
+        int64_t&            outActionID,
+        const std::wstring& causalChainIDFromParent = L""
+    );
+
+    // Fetch pending actions that need execution.
+    // Sets status to LOCKED atomically on retrieval.
+    ElleResult GetPendingActions(
+        std::vector<ElleAction>& outActions,
+        int maxBatch = ElleConfig::Queue::MAX_BATCH_SIZE
+    );
+
+    // Submit the result of an executed action.
+    // status must be SUCCESS, FAILED, or TIMEOUT.
+    ElleResult SubmitActionResult(
+        int64_t             actionID,
+        ElleActionStatus    status,
+        const std::wstring& resultJson
+    );
+
+    // Purge completed/failed actions older than ElleConfig::Queue::ACTION_RESULT_RETAIN_SEC
+    ElleResult PurgeOldResults(int& outPurged);
+
+    // Get count of locked (in-flight) actions (for watchdog monitoring)
+    ElleResult GetLockedCount(int& outCount);
+};
+
+// =============================================================================
+// ElleQueueWorker — IntentQueue poll loop
+//
+// Sole responsibility: poll IntentQueue, dispatch to registered handlers,
+// write responses back. Intent handlers call ElleActionQueue::CreateAction()
+// to queue capability work. They do NOT execute actions themselves.
+//
+// Elle.Service.Action is the sole consumer of ActionQueue. QueueWorker
+// never polls ActionQueue. This eliminates the split-brain condition where
+// two services race for the same action rows and produce duplicate or
+// conflicting execution.
+//
+// Responsibilities:
+//   1. Poll IntentQueue every POLL_INTERVAL_MS
+//   2. Claim intents atomically (PENDING -> PROCESSING, with EpochID)
+//   3. Dispatch to registered handler
+//   4. Handler creates action rows via CreateAction() if needed
+//   5. Write intent response via SubmitIntentResponse
+//   6. C++ core reads response and adjusts trust
+// =============================================================================
+
+// Signature for intent handler
+using ElleIntentHandler = std::function<ElleResult(
+    const ElleIntent&   intent,
+    std::wstring&       outResponseJson
+)>;
+
+class ElleQueueWorker
+{
+    ELLE_NONCOPYABLE(ElleQueueWorker)
+public:
+    ElleQueueWorker();
+    ~ElleQueueWorker();
+
+    // Register a handler for a specific intent type.
+    void RegisterIntentHandler(ElleIntentType type, ElleIntentHandler handler);
+
+    // Start the intent poll loop.
+    ElleResult Start();
+
+    // Signal stop and block until the worker thread exits.
+    void Stop();
+
+    bool IsRunning() const { return m_Running; }
+
+    uint64_t IntentsProcessed() const   { return m_IntentsProcessed; }
+    uint64_t IntentsFailed() const      { return m_IntentsFailed; }
+
+private:
+    static DWORD WINAPI WorkerThreadProc(LPVOID lpParam);
+    void PollCycle();
+    void ProcessIntent(const ElleIntent& intent);
+
+    ElleIntentQueue     m_IntentQueue;
+
+    std::unordered_map<int, ElleIntentHandler>  m_IntentHandlers;
+    std::mutex                                   m_RegistryMutex;
+
+    HANDLE          m_Thread;
+    HANDLE          m_StopEvent;
+    volatile bool   m_Running;
+
+    std::atomic<uint64_t> m_IntentsProcessed;
+    std::atomic<uint64_t> m_IntentsFailed;
+};

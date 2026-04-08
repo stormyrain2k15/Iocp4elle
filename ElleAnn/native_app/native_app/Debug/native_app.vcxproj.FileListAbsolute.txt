@@ -1,0 +1,8 @@
+C:\Elle\C++\ElleAnn\native_app\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\native_app\Debug\ElleAnn.config
+C:\Elle\C++\ElleAnn\native_app\Debug\Debug\lua54.dll
+C:\Users\Elle-Ann\Desktop\ElleAnn\native_app\Debug\Debug\lua54.dll
+C:\Users\Elle-Ann\Desktop\ElleAnn\native_app\Debug\lua54.dll
+C:\Users\Elle-Ann\Desktop\ElleAnn\native_app\Debug\ElleAnn.config
+C:\Users\Elle-Ann\Desktop\ElleAnn\native_app\Debug\Debug\Debug\lua54.dll
+C:\Users\Elle-Ann\Desktop\ElleAnn\native_app\Debug\Debug\Debug\Debug\lua54.dll

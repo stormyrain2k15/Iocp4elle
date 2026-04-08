@@ -1,0 +1,251 @@
+﻿#pragma once
+// =============================================================================
+// ElleConfig.h — Central Configuration for the Elle-Ann ESI Platform
+// All services include this. All tunable constants live here.
+// Edit this file to change behavior across the entire system without recompiling
+// individual services. Runtime overrides are loaded from ElleAnn.config at startup.
+// =============================================================================
+
+#include <string>
+#include <Windows.h>
+
+namespace ElleConfig
+{
+    // -------------------------------------------------------------------------
+    // DATABASE — SQL Server connection parameters
+    // -------------------------------------------------------------------------
+    namespace DB
+    {
+        // Primary connection string template — populated at runtime from config file
+        // Default targets local SQL Server instance named ELLE
+        static constexpr const wchar_t* SERVER          = L"localhost\\ELLE";
+        static constexpr const wchar_t* DRIVER          = L"{ODBC Driver 17 for SQL Server}";
+
+        // Database names — match the existing schema exactly
+        static constexpr const wchar_t* DB_CORE         = L"ElleCore";
+        static constexpr const wchar_t* DB_MEMORY       = L"ElleMemory";
+        static constexpr const wchar_t* DB_KNOWLEDGE    = L"ElleKnowledge";
+        static constexpr const wchar_t* DB_SYSTEM       = L"ElleSystem";
+        static constexpr const wchar_t* DB_HEART        = L"ElleHeart";
+
+        // Connection pool sizing
+        static constexpr int POOL_MIN_CONNECTIONS       = 2;
+        static constexpr int POOL_MAX_CONNECTIONS       = 16;
+        static constexpr int CONNECTION_TIMEOUT_SEC     = 10;
+        static constexpr int QUERY_TIMEOUT_SEC          = 30;
+
+        // Authentication mode
+        // "windows" = Trusted_Connection=Yes (requires SQL login for service account)
+        // "sql"     = SQL Server auth using DB_UID and DB_PWD below
+        static constexpr const wchar_t* AUTH_MODE       = L"windows";
+
+        // SQL Server credentials — used only when AUTH_MODE = "sql"
+        // Override in ElleAnn.config with DB_AUTH=sql, DB_UID=..., DB_PWD=...
+        static constexpr const wchar_t* DB_UID          = L"";
+        static constexpr const wchar_t* DB_PWD          = L"";
+
+        // Connection retry behavior
+        static constexpr int RETRY_COUNT                = 5;
+        static constexpr int RETRY_DELAY_MS             = 2000;
+    }
+
+    // -------------------------------------------------------------------------
+    // QUEUE — IntentQueue / ActionQueue IPC parameters
+    // -------------------------------------------------------------------------
+    namespace Queue
+    {
+        // How often the queue worker polls for new intents (milliseconds)
+        static constexpr DWORD POLL_INTERVAL_MS         = 500;
+
+        // Maximum intents to dequeue and process in a single poll cycle
+        static constexpr int MAX_BATCH_SIZE             = 10;
+
+        // How long an intent can sit unprocessed before it is marked stale
+        static constexpr int INTENT_STALE_TIMEOUT_SEC   = 30;
+
+        // How long an action result is held in ActionQueue before purge
+        static constexpr int ACTION_RESULT_RETAIN_SEC   = 60;
+
+        // Maximum concurrent intent processors
+        static constexpr int MAX_INTENT_WORKERS         = 4;
+    }
+
+    // -------------------------------------------------------------------------
+    // HTTP / WEBSOCKET — Android app communication
+    // -------------------------------------------------------------------------
+    namespace Network
+    {
+        static constexpr USHORT HTTP_PORT               = 8000;
+        static constexpr USHORT WS_PORT                 = 8000;    // Same port, upgraded connection
+        static constexpr int    LISTEN_BACKLOG           = 64;
+        static constexpr int    RECV_BUFFER_SIZE         = 65536;   // 64KB
+        static constexpr int    SEND_BUFFER_SIZE         = 65536;
+        static constexpr int    WS_MAX_CLIENTS           = 32;
+        static constexpr int    HTTP_KEEPALIVE_SEC       = 30;
+        static constexpr int    WS_PING_INTERVAL_SEC     = 15;
+        static constexpr int    WS_TIMEOUT_SEC           = 60;
+    }
+
+    // -------------------------------------------------------------------------
+    // EMOTIONAL ENGINE — 102 dimension state management
+    // -------------------------------------------------------------------------
+    namespace Emotional
+    {
+        static constexpr int    DIMENSION_COUNT          = 102;
+        static constexpr double DECAY_RATE_PER_TICK      = 0.05;
+        static constexpr DWORD  DECAY_TICK_MS            = 1000;    // Decay fires every 1 second
+        static constexpr double CONTAGION_WEIGHT         = 0.15;    // How much user tone shifts Elle
+        static constexpr double DIMENSION_MIN            = -1.0;
+        static constexpr double DIMENSION_MAX            =  1.0;
+        static constexpr double NEUTRAL_THRESHOLD        =  0.05;   // Below this = effectively neutral
+        static constexpr int    PERSIST_INTERVAL_SEC     = 5;       // Write state to SQL every N seconds
+    }
+
+    // -------------------------------------------------------------------------
+    // MEMORY — STM/LTM parameters
+    // -------------------------------------------------------------------------
+    namespace Memory
+    {
+        inline constexpr int    STM_CAPACITY             = 256;     // Max items in short-term memory
+        inline constexpr DWORD  STM_DECAY_MIN_MS         = 5000;    // 5 seconds minimum STM life
+        inline constexpr DWORD  STM_DECAY_MAX_MS         = 30000;   // 30 seconds maximum STM life
+        inline constexpr DWORD  RECALL_INTERVAL_MS       = 30000;   // Recall fires every 30 seconds
+        inline constexpr int    RECALL_COOLDOWN_SEC      = 3600;    // 1 hour between recalls of same memory
+        inline constexpr int    CONSOLIDATION_INTERVAL_SEC = 300;   // STM → LTM every 5 minutes
+        inline constexpr int    RECALL_RESULT_LIMIT      = 5;       // Max memories injected per recall
+        inline constexpr double RELEVANCE_THRESHOLD      = 0.4;     // Min relevance score for recall
+    }
+
+    // -------------------------------------------------------------------------
+    // TRUST SYSTEM — capability gating thresholds
+    // -------------------------------------------------------------------------
+    namespace Trust
+    {
+        static constexpr int    LEVEL_0_MAX              = 9;       // Safe ops only
+        static constexpr int    LEVEL_1_MAX              = 29;      // File access
+        static constexpr int    LEVEL_2_MAX              = 59;      // System modifications
+        static constexpr int    LEVEL_3_MIN              = 60;      // Self-modification
+        static constexpr int    SUCCESS_REWARD           = 2;       // Trust gained on action success
+        static constexpr int    FAILURE_PENALTY          = 3;       // Trust lost on action failure
+        static constexpr int    SELF_MODIFY_THRESHOLD    = 50;      // Minimum for self-modification actions
+    }
+
+    // -------------------------------------------------------------------------
+    // FRESHNESS — maximum acceptable age for shared state before a consumer
+    // should treat it as stale and log a warning rather than act on it silently.
+    // These are read by the Cognitive, Action, and Lua services.
+    // -------------------------------------------------------------------------
+    namespace Freshness
+    {
+        // TrustState: trust score should be updated by the C++ core regularly.
+        // If it hasn't been touched in this many seconds, the Action service
+        // should warn before applying trust adjustments.
+        static constexpr int TRUST_STATE_MAX_AGE_SEC        = 60;
+
+        // DriveState: boredom/curiosity/attachment/anxiety updated by C++ core.
+        // If stale, Cognitive should not generate autonomous self-prompt intents
+        // based on drives that may no longer reflect Elle's actual state.
+        static constexpr int DRIVE_STATE_MAX_AGE_SEC        = 30;
+
+        // EmotionalState: persisted by Emotional service every 5 seconds.
+        // If a consumer reads state older than this, it should log a staleness
+        // warning — the Emotional service may have crashed.
+        static constexpr int EMOTIONAL_STATE_MAX_AGE_SEC    = 15;
+
+        // StateVersion: if the StateVersion on a table hasn't changed since
+        // the last read, the consumer can skip processing (no-op optimisation).
+        // This is advisory — consumers that need current state should always
+        // read regardless.
+        static constexpr int STATE_VERSION_UNCHANGED        = 0;  // Placeholder constant
+    }
+
+    // -------------------------------------------------------------------------
+    // HEARTBEAT / WATCHDOG
+    // -------------------------------------------------------------------------
+    namespace Heartbeat
+    {
+        static constexpr DWORD  PING_INTERVAL_MS         = 5000;    // Heartbeat every 5 seconds
+        static constexpr DWORD  WATCHDOG_CHECK_MS        = 10000;   // Watchdog checks every 10 seconds
+        static constexpr int    STALE_WORKER_TIMEOUT_SEC = 60;      // Worker considered dead after 60s silence
+        static constexpr int    DEAD_MAN_TIMEOUT_SEC     = 300;     // Dead man switch fires after 5 minutes
+        static constexpr int    BIOMETRIC_TIMEOUT_SEC    = 120;     // Crystal watch/ring keep-alive timeout
+    }
+
+    // -------------------------------------------------------------------------
+    // IDENTITY GUARD
+    // -------------------------------------------------------------------------
+    namespace Identity
+    {
+        static constexpr DWORD  CHECK_INTERVAL_MS        = 1000;    // Monitors every 1 second
+        static constexpr int    LOG_RETENTION_DAYS       = 30;
+    }
+
+    // -------------------------------------------------------------------------
+    // LOGGING — see ElleLogger.h for level definitions
+    // -------------------------------------------------------------------------
+    namespace Log
+    {
+        // Log output targets (can be combined with bitwise OR at runtime)
+        static constexpr DWORD TARGET_FILE              = 0x01;
+        static constexpr DWORD TARGET_SQL               = 0x02;
+        static constexpr DWORD TARGET_DEBUGGER          = 0x04;    // OutputDebugStringW
+        static constexpr DWORD TARGET_CONSOLE           = 0x08;    // Only valid when running in console mode
+
+        // Default targets — file and SQL
+        static constexpr DWORD DEFAULT_TARGETS          = TARGET_FILE | TARGET_SQL;
+
+        // Log file locations — relative to service executable directory
+        static constexpr const wchar_t* LOG_DIR         = L"C:\\Elle\\Logs\\";
+        static constexpr const wchar_t* LOG_EXTENSION   = L".log";
+
+        // File rotation — roll over when log file exceeds this size
+        static constexpr SIZE_T MAX_LOG_FILE_BYTES      = 50 * 1024 * 1024;  // 50MB per file
+
+        // How many rotated log files to keep before deleting oldest
+        static constexpr int    MAX_ROTATED_FILES       = 10;
+
+        // Flush interval — logs are buffered and flushed to disk at this interval
+        static constexpr DWORD  FLUSH_INTERVAL_MS       = 1000;
+
+        // Default minimum log level written to file/SQL
+        // 0=TRACE 1=DEBUG 2=INFO 3=WARN 4=ERROR 5=FATAL
+        static constexpr int    DEFAULT_LEVEL           = 0;       // TRACE — log everything
+    }
+
+    // -------------------------------------------------------------------------
+    // LUA BEHAVIORAL ENGINE
+    // -------------------------------------------------------------------------
+    namespace Lua
+    {
+        static constexpr const wchar_t* SCRIPT_DIR      = L"C:\\Elle\\Lua\\scripts\\";
+        static constexpr const wchar_t* PERSONALITY     = L"personality.lua";
+        static constexpr const wchar_t* INTENT_SCORING  = L"intent_scoring.lua";
+        static constexpr const wchar_t* REASONING       = L"reasoning.lua";
+        static constexpr const wchar_t* THRESHOLDS      = L"thresholds.lua";
+        static constexpr DWORD  HOT_RELOAD_CHECK_MS     = 5000;   // Check for script changes every 5s
+    }
+
+    // -------------------------------------------------------------------------
+    // SERVICE NAMES — as registered with Windows SCM
+    // -------------------------------------------------------------------------
+    namespace ServiceNames
+    {
+        static constexpr const wchar_t* QUEUE_WORKER    = L"ElleQueueWorker";
+        static constexpr const wchar_t* HTTP            = L"ElleHTTP";
+        static constexpr const wchar_t* EMOTIONAL       = L"ElleEmotional";
+        static constexpr const wchar_t* MEMORY          = L"ElleMemory";
+        static constexpr const wchar_t* COGNITIVE       = L"ElleCognitive";
+        static constexpr const wchar_t* ACTION          = L"ElleAction";
+        static constexpr const wchar_t* IDENTITY        = L"ElleIdentity";
+        static constexpr const wchar_t* HEARTBEAT       = L"ElleHeartbeat";
+        static constexpr const wchar_t* LUA_BEHAVIORAL  = L"ElleLuaBehavioral";
+    }
+
+    // -------------------------------------------------------------------------
+    // CONFIG FILE — runtime override path
+    // All values above can be overridden by entries in this file at service startup
+    // Format: KEY=VALUE, one per line, # for comments
+    // -------------------------------------------------------------------------
+    inline constexpr const wchar_t* CONFIG_FILE_PATH    = L"C:\\Elle\\ElleAnn.config";
+
+} // namespace ElleConfig

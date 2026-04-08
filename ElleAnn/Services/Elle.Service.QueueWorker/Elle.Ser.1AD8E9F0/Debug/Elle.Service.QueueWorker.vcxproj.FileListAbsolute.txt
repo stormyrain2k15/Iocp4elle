@@ -1,0 +1,3 @@
+C:\Elle\C++\ElleAnn\Services\Elle.Service.QueueWorker\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Services\Elle.Service.QueueWorker\Debug\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Services\Elle.Service.QueueWorker\Debug\Debug\Debug\lua54.dll

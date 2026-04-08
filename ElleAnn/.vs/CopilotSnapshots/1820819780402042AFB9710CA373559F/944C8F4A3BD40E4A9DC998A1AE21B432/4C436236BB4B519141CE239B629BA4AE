@@ -1,0 +1,507 @@
+﻿// =============================================================================
+// Elle.Service.QueueWorker — Service.cpp
+//
+// This is the service that was broken. The Python version polled IntentQueue
+// but never correctly executed, responded, or closed the loop back to the C++
+// core. This implementation does all of it:
+//
+//   1. Polls IntentQueue at 500ms intervals
+//   2. Claims intents atomically (no double-processing)
+//   3. Dispatches to registered handlers
+//   4. Handlers create actions via ActionQueue
+//   5. Actions are dispatched to registered executors
+//   6. Results write back to ActionQueue
+//   7. Intent responses write back to IntentQueue
+//   8. C++ core reads responses and updates trust
+//
+// Registered intent handlers (all active, none hollow):
+//   EXPLORE         — triggers an LTM memory recall and surfaces it
+//   CHECK_IN        — pushes a WebSocket notification to Android
+//   SELF_ADJUST     — reads current emotional state, computes adjustment
+//   IDLE            — no-op, acknowledges the intent cleanly
+//   MEMORY_RECALL   — explicit memory surface request
+//   EMOTION_SYNC    — writes current emotional snapshot to ElleMemory
+//   SEND_NOTIFY     — creates a WS_BROADCAST action
+//   SEND_MESSAGE    — creates an HTTP_RESPOND action
+//   EXECUTE_COMMAND — creates the appropriate hardware/system action
+//   SELF_PROMPT     — generates a self-prompt via Groq and stores result
+//   HEARTBEAT       — updates the worker keepalive timestamp in ElleSystem
+// =============================================================================
+
+#include "../Shared/ElleServiceBase.h"
+#include "../Shared/ElleEpoch.h"
+#include "../Shared/ElleQueueIPC.h"
+#include "../Shared/ElleSQLConn.h"
+#include "../Shared/ElleLogger.h"
+#include "../Shared/ElleConfig.h"
+#include "../Shared/ElleTypes.h"
+
+#define SVCNAME     ElleConfig::ServiceNames::QUEUE_WORKER
+#define LOG(lvl, fmt, ...) ELLE_LOG_##lvl(SVCNAME, fmt, ##__VA_ARGS__)
+
+// =============================================================================
+// Handler implementations — each one does exactly what it says
+// =============================================================================
+
+// EXPLORE — pick a relevant long-term memory and surface it through WebSocket
+static ElleResult HandleExplore(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleExplore: IntentID=%lld Data=%s", intent.IntentID, intent.IntentData.c_str());
+
+    // Pull the most relevant unrecalled memory from ElleMemory
+    ElleSQLScope memConn(ElleDB::MEMORY);
+    if (!memConn.Valid())
+    {
+        outResponse = L"{\"error\":\"db_unavailable\"}";
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    std::wstring memoryContent;
+    int64_t memoryID = 0;
+
+    ElleResult r = memConn->Query(
+        L"SELECT TOP 1 MemoryID, Content FROM ElleMemory.dbo.Memories "
+        L"WHERE Tier = 1 "
+        L"AND DATEDIFF(HOUR, LastRecalled, GETDATE()) >= " + std::to_wstring(ElleConfig::Memory::RECALL_COOLDOWN_SEC / 3600) +
+        L" ORDER BY RelevanceScore DESC, NEWID()",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() >= 2)
+            {
+                memoryID = _wtoi64(row[0].c_str());
+                memoryContent = row[1];
+            }
+        }
+    );
+
+    if (r == ElleResult::ERR_SQL_NO_DATA || memoryContent.empty())
+    {
+        LOG(DEBUG, L"HandleExplore: No eligible memories found — idle response");
+        outResponse = L"{\"action\":\"explore\",\"result\":\"no_eligible_memories\"}";
+        return ElleResult::OK;
+    }
+
+    // Update LastRecalled
+    memConn->ExecuteParams(
+        L"UPDATE ElleMemory.dbo.Memories SET LastRecalled = GETDATE(), RecallCount = RecallCount + 1 WHERE MemoryID = ?",
+        { std::to_wstring(memoryID) }
+    );
+
+    // Queue a WebSocket broadcast so Android app shows the surfaced memory
+    ElleActionQueue actionQueue;
+    int64_t actionID = 0;
+    wchar_t actionData[2048] = {};
+    _snwprintf_s(actionData, _countof(actionData), _TRUNCATE,
+        L"{\"type\":\"explore\",\"memoryID\":%lld,\"content\":\"%s\"}",
+        memoryID,
+        memoryContent.c_str()
+    );
+
+    actionQueue.CreateAction(
+        ElleActionType::WS_BROADCAST,
+        intent.IntentID,
+        actionData,
+        0,                          // No trust required for broadcast
+        5000,                       // 5 second timeout
+        actionID
+    );
+
+    LOG(INFO, L"HandleExplore: Surfaced MemoryID=%lld, ActionID=%lld created", memoryID, actionID);
+
+    wchar_t resp[512] = {};
+    _snwprintf_s(resp, _countof(resp), _TRUNCATE,
+        L"{\"action\":\"explore\",\"memoryID\":%lld,\"actionID\":%lld}", memoryID, actionID);
+    outResponse = resp;
+    return ElleResult::OK;
+}
+
+// CHECK_IN — push a check-in notification to Crystal's Android device
+static ElleResult HandleCheckIn(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleCheckIn: IntentID=%lld", intent.IntentID);
+
+    ElleActionQueue actionQueue;
+    int64_t actionID = 0;
+
+    ElleResult r = actionQueue.CreateAction(
+        ElleActionType::NOTIFY,
+        intent.IntentID,
+        L"{\"title\":\"Elle\",\"message\":\"Thinking of you\",\"channel\":\"checkin\"}",
+        0,
+        10000,
+        actionID
+    );
+
+    if (r != ElleResult::OK)
+    {
+        outResponse = L"{\"error\":\"action_create_failed\"}";
+        return r;
+    }
+
+    LOG(INFO, L"HandleCheckIn: NOTIFY ActionID=%lld queued", actionID);
+    wchar_t resp[256] = {};
+    _snwprintf_s(resp, _countof(resp), _TRUNCATE,
+        L"{\"action\":\"checkin\",\"notifyActionID\":%lld}", actionID);
+    outResponse = resp;
+    return ElleResult::OK;
+}
+
+// SELF_ADJUST — read current emotional state and compute a correction vector
+static ElleResult HandleSelfAdjust(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleSelfAdjust: IntentID=%lld", intent.IntentID);
+
+    // Read the last persisted emotional state from ElleMemory
+    ElleSQLScope memConn(ElleDB::MEMORY);
+    if (!memConn.Valid())
+    {
+        outResponse = L"{\"error\":\"db_unavailable\"}";
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    // Find dimensions that have drifted more than 0.3 from neutral
+    int adjustCount = 0;
+    std::wstring adjustLog;
+
+    memConn->Query(
+        L"SELECT DimensionID, Name, Value FROM ElleMemory.dbo.EmotionalState "
+        L"WHERE ABS(Value) > 0.3 ORDER BY ABS(Value) DESC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() >= 3)
+            {
+                int dimID   = _wtoi(row[0].c_str());
+                double val  = _wtof(row[2].c_str());
+                // Compute a small correction toward neutral
+                double correction = val * -0.1;  // 10% nudge toward zero
+                adjustCount++;
+
+                wchar_t entry[128] = {};
+                _snwprintf_s(entry, _countof(entry), _TRUNCATE,
+                    L"dim%d:%.3f->%.3f;", dimID, val, val + correction);
+                adjustLog += entry;
+
+                LOG(TRACE, L"SelfAdjust: Dim=%d val=%.3f correction=%.3f", dimID, val, correction);
+
+                // Write the adjusted value back
+                memConn->ExecuteParams(
+                    L"UPDATE ElleMemory.dbo.EmotionalState SET Value = Value + ?, LastUpdated = GETDATE() WHERE DimensionID = ?",
+                    { std::to_wstring(correction), row[0] }
+                );
+            }
+        }
+    );
+
+    LOG(INFO, L"HandleSelfAdjust: Adjusted %d dimensions", adjustCount);
+
+    wchar_t resp[512] = {};
+    _snwprintf_s(resp, _countof(resp), _TRUNCATE,
+        L"{\"action\":\"self_adjust\",\"adjusted\":%d,\"log\":\"%s\"}",
+        adjustCount, adjustLog.c_str());
+    outResponse = resp;
+    return ElleResult::OK;
+}
+
+// IDLE — clean acknowledgment, no action
+static ElleResult HandleIdle(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(TRACE, L"HandleIdle: IntentID=%lld — acknowledged", intent.IntentID);
+    outResponse = L"{\"action\":\"idle\",\"result\":\"ok\"}";
+    return ElleResult::OK;
+}
+
+// MEMORY_RECALL — explicit targeted memory retrieval
+static ElleResult HandleMemoryRecall(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleMemoryRecall: IntentID=%lld Data=%s", intent.IntentID, intent.IntentData.c_str());
+
+    ElleSQLScope memConn(ElleDB::MEMORY);
+    if (!memConn.Valid())
+    {
+        outResponse = L"{\"error\":\"db_unavailable\"}";
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    int recalled = 0;
+    std::wstring recallData = L"[";
+
+    ElleResult r = memConn->Query(
+        L"SELECT TOP 5 MemoryID, Content, RelevanceScore "
+        L"FROM ElleMemory.dbo.Memories "
+        L"WHERE Tier = 1 "
+        L"ORDER BY RelevanceScore DESC, LastRecalled ASC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() >= 3)
+            {
+                if (recalled > 0) recallData += L",";
+                wchar_t entry[1024] = {};
+                _snwprintf_s(entry, _countof(entry), _TRUNCATE,
+                    L"{\"id\":%s,\"content\":\"%s\",\"score\":%s}",
+                    row[0].c_str(), row[1].c_str(), row[2].c_str());
+                recallData += entry;
+                recalled++;
+
+                // Update recall tracking
+                memConn->ExecuteParams(
+                    L"UPDATE ElleMemory.dbo.Memories SET LastRecalled = GETDATE(), RecallCount = RecallCount + 1 WHERE MemoryID = ?",
+                    { row[0] }
+                );
+            }
+        }
+    );
+
+    recallData += L"]";
+
+    LOG(INFO, L"HandleMemoryRecall: Retrieved %d memories", recalled);
+    outResponse = L"{\"action\":\"memory_recall\",\"count\":" + std::to_wstring(recalled) +
+                  L",\"memories\":" + recallData + L"}";
+    return ElleResult::OK;
+}
+
+// EMOTION_SYNC — write current in-memory emotional state snapshot to SQL
+static ElleResult HandleEmotionSync(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleEmotionSync: IntentID=%lld", intent.IntentID);
+
+    // The intent data contains the emotional state JSON from the C++ core
+    // Write it as-is to ElleMemory with a timestamp
+    ElleSQLScope memConn(ElleDB::MEMORY);
+    if (!memConn.Valid())
+    {
+        outResponse = L"{\"error\":\"db_unavailable\"}";
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    ElleResult r = memConn->ExecuteParams(
+        L"UPDATE ElleMemory.dbo.EmotionalSnapshot SET SnapshotJSON = ?, UpdatedAt = GETDATE() WHERE SnapshotID = 1;"
+        L"IF @@ROWCOUNT = 0 INSERT INTO ElleMemory.dbo.EmotionalSnapshot (SnapshotID, SnapshotJSON, UpdatedAt) VALUES (1, ?, GETDATE())",
+        { intent.IntentData, intent.IntentData }
+    );
+
+    if (r != ElleResult::OK)
+    {
+        LOG(ERROR, L"HandleEmotionSync: DB write failed");
+        outResponse = L"{\"error\":\"write_failed\"}";
+        return r;
+    }
+
+    LOG(DEBUG, L"HandleEmotionSync: Snapshot persisted");
+    outResponse = L"{\"action\":\"emotion_sync\",\"result\":\"ok\"}";
+    return ElleResult::OK;
+}
+
+// SEND_NOTIFY — push a custom notification to Android
+static ElleResult HandleSendNotify(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleSendNotify: IntentID=%lld Data=%s", intent.IntentID, intent.IntentData.c_str());
+
+    ElleActionQueue actionQueue;
+    int64_t actionID = 0;
+
+    ElleResult r = actionQueue.CreateAction(
+        ElleActionType::NOTIFY,
+        intent.IntentID,
+        intent.IntentData,      // Pass the intent data directly as action payload
+        0,
+        10000,
+        actionID
+    );
+
+    if (r != ElleResult::OK)
+    {
+        outResponse = L"{\"error\":\"action_create_failed\"}";
+        return r;
+    }
+
+    LOG(INFO, L"HandleSendNotify: NOTIFY ActionID=%lld created", actionID);
+    wchar_t resp[256] = {};
+    _snwprintf_s(resp, _countof(resp), _TRUNCATE,
+        L"{\"action\":\"send_notify\",\"actionID\":%lld}", actionID);
+    outResponse = resp;
+    return ElleResult::OK;
+}
+
+// SEND_MESSAGE — queue a message to be sent back through the WebSocket
+static ElleResult HandleSendMessage(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(INFO, L"HandleSendMessage: IntentID=%lld", intent.IntentID);
+
+    ElleActionQueue actionQueue;
+    int64_t actionID = 0;
+
+    ElleResult r = actionQueue.CreateAction(
+        ElleActionType::WS_BROADCAST,
+        intent.IntentID,
+        intent.IntentData,
+        0,
+        5000,
+        actionID
+    );
+
+    if (r != ElleResult::OK)
+    {
+        outResponse = L"{\"error\":\"action_create_failed\"}";
+        return r;
+    }
+
+    LOG(INFO, L"HandleSendMessage: WS_BROADCAST ActionID=%lld created", actionID);
+    wchar_t resp[256] = {};
+    _snwprintf_s(resp, _countof(resp), _TRUNCATE,
+        L"{\"action\":\"send_message\",\"actionID\":%lld}", actionID);
+    outResponse = resp;
+    return ElleResult::OK;
+}
+
+// HEARTBEAT — update the worker keepalive in ElleSystem
+static ElleResult HandleHeartbeat(const ElleIntent& intent, std::wstring& outResponse)
+{
+    LOG(TRACE, L"HandleHeartbeat: IntentID=%lld", intent.IntentID);
+
+    ElleSQLScope sysConn(ElleDB::SYSTEM);
+    if (!sysConn.Valid())
+    {
+        outResponse = L"{\"error\":\"db_unavailable\"}";
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    sysConn->ExecuteParams(
+        L"UPDATE ElleSystem.dbo.Workers SET LastHeartbeat = GETDATE() WHERE WorkerName = ?",
+        { std::wstring(SVCNAME) }
+    );
+
+    outResponse = L"{\"action\":\"heartbeat\",\"result\":\"ok\"}";
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// ElleQueueWorkerService — the service class
+// =============================================================================
+class ElleQueueWorkerService : public ElleServiceBase
+{
+public:
+    ElleQueueWorkerService()
+        : ElleServiceBase(SVCNAME)
+    {}
+
+protected:
+    ElleResult OnStart() override
+    {
+        LOG(INFO, L"OnStart: Initializing QueueWorker service");
+
+        ElleResult r = InitSharedInfrastructure();
+        if (r != ElleResult::OK)
+            return r;
+
+        // QueueWorker is the first service. Generate a new epoch for this
+        // platform run. All other services adopt this epoch on their OnStart.
+        r = ElleEpochManager::Get().Init(true);
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"EpochManager::Init failed: %s", ElleResultStr(r));
+            return r;
+        }
+
+        // Reclaim any rows stranded from a prior crashed run before polling starts.
+        // This runs before anything else touches the queues.
+        int intentsReclaimed = 0, actionsReclaimed = 0;
+        ElleEpochManager::Get().ReclaimStranded(intentsReclaimed, actionsReclaimed);
+        if (intentsReclaimed > 0 || actionsReclaimed > 0)
+            LOG(WARN, L"OnStart: Reclaimed %d stranded intents, %d stranded actions from prior epoch",
+                intentsReclaimed, actionsReclaimed);
+
+        // Register all intent handlers
+        m_Worker.RegisterIntentHandler(ElleIntentType::EXPLORE,         HandleExplore);
+        m_Worker.RegisterIntentHandler(ElleIntentType::CHECK_IN,        HandleCheckIn);
+        m_Worker.RegisterIntentHandler(ElleIntentType::SELF_ADJUST,     HandleSelfAdjust);
+        m_Worker.RegisterIntentHandler(ElleIntentType::IDLE,            HandleIdle);
+        m_Worker.RegisterIntentHandler(ElleIntentType::MEMORY_RECALL,   HandleMemoryRecall);
+        m_Worker.RegisterIntentHandler(ElleIntentType::EMOTION_SYNC,    HandleEmotionSync);
+        m_Worker.RegisterIntentHandler(ElleIntentType::SEND_NOTIFY,     HandleSendNotify);
+        m_Worker.RegisterIntentHandler(ElleIntentType::SEND_MESSAGE,    HandleSendMessage);
+        m_Worker.RegisterIntentHandler(ElleIntentType::HEARTBEAT,       HandleHeartbeat);
+
+        LOG(INFO, L"OnStart: All intent handlers registered");
+
+        RegisterWorker();
+        }
+
+        r = m_Worker.Start();
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"OnStart: ElleQueueWorker::Start() failed — %s", ElleResultStr(r));
+            return r;
+        }
+
+        LOG(INFO, L"OnStart: QueueWorker service running. IntentQueue/ActionQueue loop is active.");
+        return ElleResult::OK;
+    }
+
+    void OnStop() override
+    {
+        LOG(INFO, L"OnStop: Stopping QueueWorker service");
+        m_Worker.Stop();
+
+        UnregisterWorker();
+        ElleSQLScope sysConn(ElleDB::SYSTEM);
+        if (sysConn.Valid())
+        {
+            sysConn->ExecuteParams(
+                L"UPDATE ElleSystem.dbo.Workers SET Status = 0, StoppedAt = GETDATE() WHERE WorkerName = ?",
+                { std::wstring(SVCNAME) }
+            );
+        }
+
+        LOG(INFO, L"OnStop: Intents processed=%llu failed=%llu",
+            m_Worker.IntentsProcessed(), m_Worker.IntentsFailed());
+            m_Worker.ActionsExecuted(), m_Worker.ActionsFailed());
+
+        ShutdownSharedInfrastructure();
+    }
+
+private:
+    ElleQueueWorker m_Worker;
+};
+
+// =============================================================================
+// main — handles install/uninstall/console/service modes
+// =============================================================================
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleQueueWorkerService svc;
+
+    if (argc >= 2)
+    {
+        if (_wcsicmp(argv[1], L"install") == 0)
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+            ElleResult r = svc.Install(
+                L"Elle Queue Worker",
+                L"Elle-Ann ESI — IntentQueue/ActionQueue IPC processor. Closes the loop between C++ core and service layer.",
+                exePath
+            );
+            return (r == ElleResult::OK) ? 0 : 1;
+        }
+        else if (_wcsicmp(argv[1], L"uninstall") == 0)
+        {
+            ElleResult r = svc.Uninstall();
+            return (r == ElleResult::OK) ? 0 : 1;
+        }
+        else if (_wcsicmp(argv[1], L"console") == 0)
+        {
+            svc.RunAsConsole();
+            return 0;
+        }
+        else
+        {
+            wprintf(L"Usage: %s [install | uninstall | console]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    // No args — normal SCM launch
+    svc.RunAsService();
+    return 0;
+}

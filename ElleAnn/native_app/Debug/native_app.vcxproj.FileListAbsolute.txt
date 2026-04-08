@@ -1,0 +1,5 @@
+C:\Elle\C++\ElleAnn\Debug\Debug\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Debug\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Debug\lua54.dll
+C:\Elle\C++\ElleAnn\Debug\ElleAnn.config
+C:\Elle\C++\ElleAnn\native_app\Debug\native_app.exe

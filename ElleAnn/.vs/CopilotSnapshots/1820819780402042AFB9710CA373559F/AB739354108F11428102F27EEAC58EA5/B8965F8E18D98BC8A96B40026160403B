@@ -1,0 +1,523 @@
+﻿// =============================================================================
+// ElleLogger.cpp — Implementation
+// =============================================================================
+
+#include "ElleLogger.h"
+#include <sqlext.h>     // ODBC
+#include <sql.h>
+#include <cstdarg>
+#include <cwchar>
+#include <sstream>
+#include <iomanip>
+#include <io.h>
+#include <fcntl.h>
+
+// =============================================================================
+// Singleton
+// =============================================================================
+ElleLogger& ElleLogger::Get()
+{
+    static ElleLogger instance;
+    return instance;
+}
+
+// Narrow overload: convert char* file/function to wide and forward
+void ElleLogger::Write(
+    ElleLogLevel    level,
+    const wchar_t*  serviceName,
+    const char*     sourceFile,
+    int             sourceLine,
+    const char*     functionName,
+    const wchar_t*  fmt,
+    ...
+)
+{
+    // Convert narrow strings to wide using simple widening
+    std::wstring wf = sourceFile ? std::wstring(sourceFile, sourceFile + strlen(sourceFile)) : std::wstring();
+    std::wstring fn = functionName ? std::wstring(functionName, functionName + strlen(functionName)) : std::wstring();
+
+    va_list args;
+    va_start(args, fmt);
+    // Forward to wide implementation by formatting the message here and
+    // calling the wide Write with the formatted buffer.
+    wchar_t msgBuf[4096] = {};
+    _vsnwprintf_s(msgBuf, _countof(msgBuf), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    // Build entry directly to avoid double formatting
+    ElleLogEntry entry;
+    GetLocalTime(&entry.Timestamp);
+    entry.ThreadID      = GetCurrentThreadId();
+    entry.Level         = level;
+    entry.ServiceName   = serviceName ? serviceName : L"Unknown";
+    entry.SourceFile    = ShortFileName(wf.empty() ? L"" : wf.c_str());
+    entry.SourceLine    = sourceLine;
+    entry.FunctionName  = fn.empty() ? L"" : fn.c_str();
+    entry.Message       = msgBuf;
+
+    WriteEntry(entry);
+}
+
+ElleLogger::ElleLogger()
+    : m_Targets(ElleConfig::Log::DEFAULT_TARGETS)
+    , m_MinLevel(static_cast<ElleLogLevel>(ElleConfig::Log::DEFAULT_LEVEL))
+    , m_LogFileBytesWritten(0)
+    , m_RotationIndex(0)
+    , m_Initialized(false)
+    , m_EntryCount(0)
+    , m_DroppedCount(0)
+    , m_SqlHDBC(nullptr)
+    , m_SqlHENV(nullptr)
+{
+}
+
+ElleLogger::~ElleLogger()
+{
+    Shutdown();
+}
+
+// =============================================================================
+// Init — must be called once at service startup before any logging
+// =============================================================================
+ElleResult ElleLogger::Init(
+    const std::wstring& serviceName,
+    DWORD               targets,
+    ElleLogLevel        minLevel,
+    const std::wstring& sqlConnStr
+)
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+
+    if (m_Initialized)
+        return ElleResult::OK;
+
+    m_ServiceName   = serviceName;
+    m_Targets       = targets;
+    m_MinLevel      = minLevel;
+    m_SqlConnStr    = sqlConnStr;
+
+    // Create log directory if it doesn't exist
+    if (targets & ElleConfig::Log::TARGET_FILE)
+    {
+        CreateDirectoryW(ElleConfig::Log::LOG_DIR, nullptr);
+
+        ElleResult fileResult = OpenLogFile();
+        if (fileResult != ElleResult::OK)
+        {
+            // File logging failed — fall back to debugger so we don't lose the failure reason
+            m_Targets &= ~ElleConfig::Log::TARGET_FILE;
+            m_Targets |= ElleConfig::Log::TARGET_DEBUGGER;
+            OutputDebugStringW(L"[ELLE][FATAL] ElleLogger failed to open log file. Falling back to debugger output.\n");
+        }
+    }
+
+    // Initialize SQL logging connection
+    if ((targets & ElleConfig::Log::TARGET_SQL) && !sqlConnStr.empty())
+    {
+        SQLHENV hEnv = nullptr;
+        SQLHDBC hDBC = nullptr;
+        SQLRETURN ret;
+
+        ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &hEnv);
+        if (!SQL_SUCCEEDED(ret))
+        {
+            m_Targets &= ~ElleConfig::Log::TARGET_SQL;
+            OutputDebugStringW(L"[ELLE][WARN] SQLAllocHandle(ENV) failed. SQL log target disabled.\n");
+        }
+        else
+        {
+            SQLSetEnvAttr(hEnv, SQL_ATTR_ODBC_VERSION, (void*)SQL_OV_ODBC3, 0);
+
+            ret = SQLAllocHandle(SQL_HANDLE_DBC, hEnv, &hDBC);
+            if (!SQL_SUCCEEDED(ret))
+            {
+                SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+                m_Targets &= ~ElleConfig::Log::TARGET_SQL;
+                OutputDebugStringW(L"[ELLE][WARN] SQLAllocHandle(DBC) failed. SQL log target disabled.\n");
+            }
+            else
+            {
+                SQLWCHAR outConnStr[1024] = {};
+                SQLSMALLINT outLen = 0;
+
+                ret = SQLDriverConnectW(
+                    hDBC,
+                    nullptr,
+                    (SQLWCHAR*)sqlConnStr.c_str(),
+                    (SQLSMALLINT)sqlConnStr.length(),
+                    outConnStr,
+                    1024,
+                    &outLen,
+                    SQL_DRIVER_NOPROMPT
+                );
+
+                if (!SQL_SUCCEEDED(ret))
+                {
+                    SQLFreeHandle(SQL_HANDLE_DBC, hDBC);
+                    SQLFreeHandle(SQL_HANDLE_ENV, hEnv);
+                    m_Targets &= ~ElleConfig::Log::TARGET_SQL;
+                    OutputDebugStringW(L"[ELLE][WARN] SQL connection for log target failed. SQL log target disabled.\n");
+                }
+                else
+                {
+                    m_SqlHENV = hEnv;
+                    m_SqlHDBC = hDBC;
+                }
+            }
+        }
+    }
+
+    m_Initialized = true;
+
+    // Write the first entry to confirm logger is alive
+    Write(ElleLogLevel::INFO, m_ServiceName.c_str(), __FILE__, __LINE__, __FUNCTION__,
+        L"ElleLogger initialized. Service=[%s] Targets=0x%02X MinLevel=%d",
+        m_ServiceName.c_str(), m_Targets, static_cast<int>(m_MinLevel));
+
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// Shutdown — flush and release all resources
+// =============================================================================
+void ElleLogger::Shutdown()
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+
+    if (!m_Initialized)
+        return;
+
+    Write(ElleLogLevel::INFO, m_ServiceName.c_str(), __FILE__, __LINE__, __FUNCTION__,
+        L"ElleLogger shutting down. TotalEntries=%llu Dropped=%llu",
+        m_EntryCount.load(), m_DroppedCount.load());
+
+    if (m_LogFile.is_open())
+    {
+        m_LogFile.flush();
+        m_LogFile.close();
+    }
+
+    if (m_SqlHDBC)
+    {
+        SQLDisconnect((SQLHDBC)m_SqlHDBC);
+        SQLFreeHandle(SQL_HANDLE_DBC, (SQLHDBC)m_SqlHDBC);
+        m_SqlHDBC = nullptr;
+    }
+
+    if (m_SqlHENV)
+    {
+        SQLFreeHandle(SQL_HANDLE_ENV, (SQLHENV)m_SqlHENV);
+        m_SqlHENV = nullptr;
+    }
+
+    m_Initialized = false;
+}
+
+// =============================================================================
+// Write — primary logging function, called by macros
+// =============================================================================
+void ElleLogger::Write(
+    ElleLogLevel    level,
+    const wchar_t*  serviceName,
+    const wchar_t*  sourceFile,
+    int             sourceLine,
+    const wchar_t*  functionName,
+    const wchar_t*  fmt,
+    ...
+)
+{
+    if (level < m_MinLevel)
+        return;
+
+    // Format the message with variadic args
+    wchar_t msgBuf[4096] = {};
+    va_list args;
+    va_start(args, fmt);
+    _vsnwprintf_s(msgBuf, _countof(msgBuf), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    ElleLogEntry entry;
+    GetLocalTime(&entry.Timestamp);
+    entry.ThreadID      = GetCurrentThreadId();
+    entry.Level         = level;
+    entry.ServiceName   = serviceName ? serviceName : L"Unknown";
+    entry.SourceFile    = ShortFileName(sourceFile ? sourceFile : L"");
+    entry.SourceLine    = sourceLine;
+    entry.FunctionName  = functionName ? functionName : L"";
+    entry.Message       = msgBuf;
+
+    WriteEntry(entry);
+}
+
+// =============================================================================
+// WriteWin32Error — formats a Win32 error code into a readable message
+// =============================================================================
+void ElleLogger::WriteWin32Error(
+    ElleLogLevel    level,
+    const wchar_t*  serviceName,
+    const wchar_t*  sourceFile,
+    int             sourceLine,
+    const wchar_t*  functionName,
+    const wchar_t*  context,
+    DWORD           win32Error
+)
+{
+    wchar_t errMsgBuf[512] = {};
+    FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        win32Error,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        errMsgBuf,
+        _countof(errMsgBuf),
+        nullptr
+    );
+
+    // Strip trailing newline that FormatMessage often appends
+    size_t len = wcslen(errMsgBuf);
+    while (len > 0 && (errMsgBuf[len - 1] == L'\n' || errMsgBuf[len - 1] == L'\r'))
+        errMsgBuf[--len] = L'\0';
+
+    // Convert errMsgBuf to std::wstring for the formatted Write call
+    Write(level, serviceName, sourceFile, sourceLine, functionName,
+        L"%s — Win32 Error 0x%08X: %s",
+        context, win32Error, errMsgBuf);
+}
+
+// =============================================================================
+// WriteEntry — thread-safe dispatch to all active targets
+// =============================================================================
+void ElleLogger::WriteEntry(const ElleLogEntry& entry)
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+
+    std::wstring formatted = FormatEntry(entry);
+    bool anyFailed = false;
+
+    if (m_Targets & ElleConfig::Log::TARGET_FILE)
+        WriteToFile(formatted);
+
+    if (m_Targets & ElleConfig::Log::TARGET_SQL)
+        WriteToSQL(entry);
+
+    if (m_Targets & ElleConfig::Log::TARGET_DEBUGGER)
+        WriteToDebugger(formatted);
+
+    if (m_Targets & ElleConfig::Log::TARGET_CONSOLE)
+        WriteToConsole(entry, formatted);
+
+    m_EntryCount.fetch_add(1, std::memory_order_relaxed);
+    if (anyFailed)
+        m_DroppedCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+// =============================================================================
+// FormatEntry — produces the single-line log string
+// Format: [YYYY-MM-DD HH:MM:SS.mmm] [TID:00000] [LEVEL  ] [ServiceName] [File:Line] Function — Message
+// =============================================================================
+std::wstring ElleLogger::FormatEntry(const ElleLogEntry& entry) const
+{
+    wchar_t buf[8192] = {};
+    _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+        L"[%04d-%02d-%02d %02d:%02d:%02d.%03d] [TID:%05lu] [%-7s] [%-20s] [%s:%d] %s — %s\n",
+        entry.Timestamp.wYear,
+        entry.Timestamp.wMonth,
+        entry.Timestamp.wDay,
+        entry.Timestamp.wHour,
+        entry.Timestamp.wMinute,
+        entry.Timestamp.wSecond,
+        entry.Timestamp.wMilliseconds,
+        entry.ThreadID,
+        LevelStr(entry.Level),
+        entry.ServiceName.c_str(),
+        entry.SourceFile.c_str(),
+        entry.SourceLine,
+        entry.FunctionName.c_str(),
+        entry.Message.c_str()
+    );
+    return std::wstring(buf);
+}
+
+// =============================================================================
+// WriteToFile — appends to current log file, rotates when size limit hit
+// =============================================================================
+void ElleLogger::WriteToFile(const std::wstring& line)
+{
+    if (!m_LogFile.is_open())
+    {
+        if (OpenLogFile() != ElleResult::OK)
+            return;
+    }
+
+    m_LogFile << line;
+    m_LogFileBytesWritten += line.size() * sizeof(wchar_t);
+
+    // Rotate if over size limit
+    if (m_LogFileBytesWritten >= ElleConfig::Log::MAX_LOG_FILE_BYTES)
+    {
+        m_LogFile.flush();
+        m_LogFile.close();
+        m_LogFileBytesWritten = 0;
+        m_RotationIndex++;
+        OpenLogFile();
+    }
+}
+
+// =============================================================================
+// WriteToSQL — inserts one row into ElleSystem.Logs
+// =============================================================================
+void ElleLogger::WriteToSQL(const ElleLogEntry& entry)
+{
+    if (!m_SqlHDBC)
+        return;
+
+    // Build the INSERT statement
+    // Table: ElleSystem.dbo.Logs
+    // Columns: Timestamp, ThreadID, Level, ServiceName, SourceFile, SourceLine, FunctionName, Message
+    const wchar_t* sql =
+        L"INSERT INTO ElleSystem.dbo.Logs "
+        L"(Timestamp, ThreadID, Level, ServiceName, SourceFile, SourceLine, FunctionName, Message) "
+        L"VALUES (GETDATE(), ?, ?, ?, ?, ?, ?, ?)";
+
+    SQLHSTMT hStmt = nullptr;
+    SQLRETURN ret = SQLAllocHandle(SQL_HANDLE_STMT, (SQLHDBC)m_SqlHDBC, &hStmt);
+    if (!SQL_SUCCEEDED(ret))
+        return;
+
+    int levelInt        = static_cast<int>(entry.Level);
+    SQLLEN cbThreadID   = 0;
+    SQLLEN cbLevel      = 0;
+    SQLLEN cbSvc        = SQL_NTS;
+    SQLLEN cbFile       = SQL_NTS;
+    SQLLEN cbLine       = 0;
+    SQLLEN cbFunc       = SQL_NTS;
+    SQLLEN cbMsg        = SQL_NTS;
+
+    DWORD threadID = entry.ThreadID;
+
+    SQLBindParameter(hStmt, 1, SQL_PARAM_INPUT, SQL_C_ULONG,  SQL_INTEGER,  0, 0, &threadID,                             0, &cbThreadID);
+    SQLBindParameter(hStmt, 2, SQL_PARAM_INPUT, SQL_C_LONG,   SQL_INTEGER,  0, 0, &levelInt,                             0, &cbLevel);
+    SQLBindParameter(hStmt, 3, SQL_PARAM_INPUT, SQL_C_WCHAR,  SQL_WVARCHAR, 64,  0, (SQLPOINTER)entry.ServiceName.c_str(), 0, &cbSvc);
+    SQLBindParameter(hStmt, 4, SQL_PARAM_INPUT, SQL_C_WCHAR,  SQL_WVARCHAR, 256, 0, (SQLPOINTER)entry.SourceFile.c_str(),  0, &cbFile);
+    SQLBindParameter(hStmt, 5, SQL_PARAM_INPUT, SQL_C_LONG,   SQL_INTEGER,  0, 0, (SQLPOINTER)&entry.SourceLine,          0, &cbLine);
+    SQLBindParameter(hStmt, 6, SQL_PARAM_INPUT, SQL_C_WCHAR,  SQL_WVARCHAR, 256, 0, (SQLPOINTER)entry.FunctionName.c_str(),0, &cbFunc);
+    SQLBindParameter(hStmt, 7, SQL_PARAM_INPUT, SQL_C_WCHAR,  SQL_WVARCHAR, 4000,0, (SQLPOINTER)entry.Message.c_str(),    0, &cbMsg);
+
+    SQLExecDirectW(hStmt, (SQLWCHAR*)sql, SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+}
+
+// =============================================================================
+// WriteToDebugger
+// =============================================================================
+void ElleLogger::WriteToDebugger(const std::wstring& line)
+{
+    OutputDebugStringW(line.c_str());
+}
+
+// =============================================================================
+// WriteToConsole — WARN and above go to stderr, rest to stdout
+// =============================================================================
+void ElleLogger::WriteToConsole(const ElleLogEntry& entry, const std::wstring& line)
+{
+    FILE* target = (entry.Level >= ElleLogLevel::WARN) ? stderr : stdout;
+    fwprintf(target, L"%s", line.c_str());
+}
+
+// =============================================================================
+// OpenLogFile — builds the path and opens/creates the log file
+// =============================================================================
+ElleResult ElleLogger::OpenLogFile()
+{
+    wchar_t pathBuf[MAX_PATH] = {};
+    if (m_RotationIndex == 0)
+    {
+        _snwprintf_s(pathBuf, _countof(pathBuf), _TRUNCATE,
+            L"%s%s%s",
+            ElleConfig::Log::LOG_DIR,
+            m_ServiceName.c_str(),
+            ElleConfig::Log::LOG_EXTENSION);
+    }
+    else
+    {
+        _snwprintf_s(pathBuf, _countof(pathBuf), _TRUNCATE,
+            L"%s%s.%04d%s",
+            ElleConfig::Log::LOG_DIR,
+            m_ServiceName.c_str(),
+            m_RotationIndex,
+            ElleConfig::Log::LOG_EXTENSION);
+    }
+
+    m_LogFilePath = pathBuf;
+
+    // Open in append mode, UTF-16 LE output
+    m_LogFile.open(m_LogFilePath, std::ios::out | std::ios::app);
+    if (!m_LogFile.is_open())
+        return ElleResult::ERR_GENERIC;
+
+    // Write BOM if new file (size == 0 after open)
+    // wofstream handles wchar encoding through the locale
+    m_LogFile.imbue(std::locale(""));
+
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// ShortFileName — strips directory prefix from __FILE__ path
+// =============================================================================
+std::wstring ElleLogger::ShortFileName(const std::wstring& fullPath) const
+{
+    size_t pos = fullPath.find_last_of(L"\\/");
+    if (pos == std::wstring::npos)
+        return fullPath;
+    return fullPath.substr(pos + 1);
+}
+
+// =============================================================================
+// LevelStr — returns fixed-width level label
+// =============================================================================
+const wchar_t* ElleLogger::LevelStr(ElleLogLevel level) const
+{
+    switch (level)
+    {
+        case ElleLogLevel::TRACE:   return L"TRACE";
+        case ElleLogLevel::DEBUG:   return L"DEBUG";
+        case ElleLogLevel::INFO:    return L"INFO";
+        case ElleLogLevel::WARN:    return L"WARN";
+        case ElleLogLevel::ERROR:   return L"ERROR";
+        case ElleLogLevel::FATAL:   return L"FATAL";
+        default:                    return L"UNKNOWN";
+    }
+}
+
+// =============================================================================
+// Runtime setters
+// =============================================================================
+void ElleLogger::SetMinLevel(ElleLogLevel level)
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+    m_MinLevel = level;
+}
+
+void ElleLogger::SetTargets(DWORD targets)
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+    m_Targets = targets;
+}
+
+void ElleLogger::Flush()
+{
+    std::lock_guard<std::mutex> lock(m_WriteMutex);
+    if (m_LogFile.is_open())
+        m_LogFile.flush();
+}
+
+uint64_t ElleLogger::EntryCount() const
+{
+    return m_EntryCount.load(std::memory_order_relaxed);
+}
+
+uint64_t ElleLogger::DroppedCount() const
+{
+    return m_DroppedCount.load(std::memory_order_relaxed);
+}

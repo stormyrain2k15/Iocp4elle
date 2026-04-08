@@ -1,0 +1,341 @@
+﻿; =============================================================================
+; Elle.ASM.Process.asm — Process Control DLL
+; x64 MASM, Windows x64 ABI, strict register preservation
+;
+; Exports:
+;   ElleLaunchProcess(LPCWSTR exePath, LPCWSTR args, DWORD* outPID) -> BOOL
+;       RCX = exePath, RDX = args (nullable), R8 = outPID
+;
+;   ElleKillProcess(DWORD pid) -> BOOL
+;       RCX = pid
+;
+;   ElleListProcesses(LPWSTR outBuffer, DWORD bufferChars) -> BOOL
+;       RCX = outBuffer, RDX = bufferChars
+;
+; All functions preserve RBX, RBP, RDI, RSI, R12-R15 per ABI.
+; All calls made from these functions include the required 32-byte shadow space.
+; =============================================================================
+
+OPTION CASEMAP:NONE
+
+EXTERN  CreateProcessW:PROC         ; kernel32
+EXTERN  OpenProcess:PROC            ; kernel32
+EXTERN  TerminateProcess:PROC       ; kernel32
+EXTERN  CloseHandle:PROC            ; kernel32
+EXTERN  CreateToolhelp32Snapshot:PROC  ; kernel32
+EXTERN  Process32FirstW:PROC        ; kernel32
+EXTERN  Process32NextW:PROC         ; kernel32
+EXTERN  lstrcatW:PROC               ; kernel32
+EXTERN  lstrlenW:PROC               ; kernel32
+EXTERN  RtlZeroMemory:PROC          ; ntdll
+
+; STARTUPINFOW size = 104 bytes
+; PROCESS_INFORMATION size = 24 bytes
+STARTUPINFOW_SIZE   EQU 104
+PROCINFO_SIZE       EQU 24
+
+; PROCESSENTRY32W size = 556 bytes
+PE32W_SIZE          EQU 556
+; szExeFile offset in PROCESSENTRY32W = 44 bytes (after dwSize+cntUsage+th32ProcessID+th32DefaultHeapID+th32ModuleID+cntThreads+th32ParentProcessID+pcPriClassBase+dwFlags)
+PE32W_EXEFILE_OFF   EQU 44
+; th32ProcessID offset = 8
+PE32W_PID_OFF       EQU 8
+
+; CreateToolhelp32Snapshot flags
+TH32CS_SNAPPROCESS  EQU 2
+
+; Process access rights
+PROCESS_TERMINATE               EQU 0001h
+PROCESS_QUERY_LIMITED_INFORMATION EQU 1000h
+
+.DATA
+    ALIGN 8
+    g_StartupInfo   DB STARTUPINFOW_SIZE DUP(0)
+    g_ProcInfo      DB PROCINFO_SIZE DUP(0)
+    g_PE32W         DB PE32W_SIZE DUP(0)
+
+    ; Separator string used when building process list
+    g_Separator     DW ';', 0       ; L";"
+
+.CODE
+
+DllMain PROC
+    MOV     RAX, 1
+    RET
+DllMain ENDP
+
+; =============================================================================
+; ElleLaunchProcess
+;
+; RCX = LPCWSTR exePath    (required)
+; RDX = LPCWSTR args       (nullable — if NULL, passes NULL to CreateProcessW)
+; R8  = DWORD* outPID      (required — receives the new process PID)
+;
+; Creates the process with CreateProcessW, writes the PID to *outPID,
+; closes both process and thread handles from PROCESS_INFORMATION,
+; and returns TRUE on success.
+; =============================================================================
+ElleLaunchProcess PROC
+    PUSH    RBX
+    PUSH    RDI
+    PUSH    RSI
+    PUSH    R12
+    PUSH    R13
+    PUSH    R14
+    SUB     RSP, 32                 ; Shadow space
+
+    ; Null check on required params
+    TEST    RCX, RCX
+    JZ      Launch_Fail
+    TEST    R8, R8
+    JZ      Launch_Fail
+
+    MOV     R12, RCX               ; Save exePath
+    MOV     R13, RDX               ; Save args (may be NULL)
+    MOV     R14, R8                ; Save outPID pointer
+
+    ; Zero out STARTUPINFOW and PROCESS_INFORMATION
+    LEA     RCX, g_StartupInfo
+    MOV     RDX, STARTUPINFOW_SIZE
+    CALL    RtlZeroMemory
+
+    LEA     RCX, g_ProcInfo
+    MOV     RDX, PROCINFO_SIZE
+    CALL    RtlZeroMemory
+
+    ; Set cb field of STARTUPINFOW (dwSize = first DWORD = STARTUPINFOW_SIZE)
+    MOV     DWORD PTR [g_StartupInfo], STARTUPINFOW_SIZE
+
+    ; CreateProcessW(
+    ;   lpApplicationName  = R12 (exePath),
+    ;   lpCommandLine      = R13 (args, may be NULL),
+    ;   lpProcessAttributes = NULL,
+    ;   lpThreadAttributes  = NULL,
+    ;   bInheritHandles     = FALSE,
+    ;   dwCreationFlags     = 0,
+    ;   lpEnvironment       = NULL (inherit),
+    ;   lpCurrentDirectory  = NULL (inherit),
+    ;   lpStartupInfo       = &g_StartupInfo,
+    ;   lpProcessInformation = &g_ProcInfo
+    ; )
+    MOV     RCX,  R12              ; lpApplicationName
+    MOV     RDX,  R13              ; lpCommandLine
+    XOR     R8,   R8               ; lpProcessAttributes = NULL
+    XOR     R9,   R9               ; lpThreadAttributes  = NULL
+    ; Additional args go on the stack (beyond first 4, above shadow space)
+    ; Stack layout at this point: RSP+32=shadow space end
+    ; We need 6 more params: 5th=FALSE, 6th=0, 7th=NULL, 8th=NULL, 9th=&SI, 10th=&PI
+    SUB     RSP, 64                ; Space for 6 additional params (8 bytes each) + alignment
+    MOV     QWORD PTR [RSP+32],  0              ; bInheritHandles = FALSE
+    MOV     QWORD PTR [RSP+40],  0              ; dwCreationFlags = 0
+    MOV     QWORD PTR [RSP+48],  0              ; lpEnvironment = NULL
+    MOV     QWORD PTR [RSP+56],  0              ; lpCurrentDirectory = NULL
+    LEA     RAX,  g_StartupInfo
+    MOV     QWORD PTR [RSP+64],  RAX            ; lpStartupInfo
+    LEA     RAX,  g_ProcInfo
+    MOV     QWORD PTR [RSP+72],  RAX            ; lpProcessInformation
+    CALL    CreateProcessW
+    ADD     RSP, 64
+
+    TEST    EAX, EAX
+    JZ      Launch_Fail
+
+    ; Write PID to *outPID
+    MOV     EAX, DWORD PTR [g_ProcInfo + 16]   ; PROCESS_INFORMATION.dwProcessId at offset 16
+    MOV     DWORD PTR [R14], EAX
+
+    ; Close the process and thread handles — we don't need them
+    MOV     RCX, QWORD PTR [g_ProcInfo + 0]    ; hProcess at offset 0
+    TEST    RCX, RCX
+    JZ      Launch_CloseThread
+    CALL    CloseHandle
+
+Launch_CloseThread:
+    MOV     RCX, QWORD PTR [g_ProcInfo + 8]    ; hThread at offset 8
+    TEST    RCX, RCX
+    JZ      Launch_Success
+    CALL    CloseHandle
+
+Launch_Success:
+    MOV     RAX, 1
+    JMP     Launch_Exit
+
+Launch_Fail:
+    XOR     RAX, RAX
+
+Launch_Exit:
+    ADD     RSP, 32
+    POP     R14
+    POP     R13
+    POP     R12
+    POP     RSI
+    POP     RDI
+    POP     RBX
+    RET
+ElleLaunchProcess ENDP
+
+; =============================================================================
+; ElleKillProcess
+;
+; RCX = pid (DWORD)
+; Returns: RAX = 1 (success), 0 (failure)
+;
+; Opens the process with PROCESS_TERMINATE, calls TerminateProcess(hProc, 1),
+; then closes the handle.
+; =============================================================================
+ElleKillProcess PROC
+    PUSH    RBX
+    PUSH    RDI
+    SUB     RSP, 32
+
+    TEST    ECX, ECX
+    JZ      Kill_Fail
+
+    MOV     EBX, ECX               ; Save pid
+
+    ; OpenProcess(PROCESS_TERMINATE, FALSE, pid)
+    MOV     ECX, PROCESS_TERMINATE
+    XOR     EDX, EDX               ; bInheritHandle = FALSE
+    MOV     R8D, EBX               ; dwProcessId
+    CALL    OpenProcess
+    TEST    RAX, RAX
+    JZ      Kill_Fail
+
+    MOV     RDI, RAX               ; Save hProcess
+
+    ; TerminateProcess(hProcess, 1)
+    MOV     RCX, RDI
+    MOV     EDX, 1                 ; uExitCode = 1 (abnormal termination)
+    CALL    TerminateProcess
+    PUSH    RAX                    ; Save result
+
+    ; CloseHandle(hProcess)
+    MOV     RCX, RDI
+    CALL    CloseHandle
+
+    POP     RAX
+    TEST    EAX, EAX
+    JZ      Kill_Fail
+
+    MOV     RAX, 1
+    JMP     Kill_Exit
+
+Kill_Fail:
+    XOR     RAX, RAX
+
+Kill_Exit:
+    ADD     RSP, 32
+    POP     RDI
+    POP     RBX
+    RET
+ElleKillProcess ENDP
+
+; =============================================================================
+; ElleListProcesses
+;
+; RCX = LPWSTR outBuffer  (caller-allocated, receives semicolon-delimited list)
+; RDX = DWORD bufferChars (size of outBuffer in wchar_t units)
+; Returns: RAX = 1 (success), 0 (failure)
+;
+; Uses Toolhelp32 to enumerate all running processes and write their names
+; to outBuffer as a semicolon-separated list, e.g.:
+;   "System;svchost.exe;ElleQueueWorker.exe;elle_runtime.exe;"
+; =============================================================================
+ElleListProcesses PROC
+    PUSH    RBX
+    PUSH    RDI
+    PUSH    RSI
+    PUSH    R12
+    PUSH    R13
+    SUB     RSP, 32
+
+    TEST    RCX, RCX
+    JZ      List_Fail
+    TEST    RDX, RDX
+    JZ      List_Fail
+
+    MOV     R12, RCX               ; Save outBuffer
+    MOV     R13D, EDX              ; Save bufferChars
+
+    ; Zero the output buffer first — caller's buffer
+    ; (We write incrementally, so start clean)
+    MOV     QWORD PTR [R12], 0     ; At minimum null-terminate position 0
+
+    ; CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    MOV     ECX, TH32CS_SNAPPROCESS
+    XOR     EDX, EDX
+    CALL    CreateToolhelp32Snapshot
+    CMP     RAX, -1                ; INVALID_HANDLE_VALUE
+    JE      List_Fail
+
+    MOV     RBX, RAX               ; Save snapshot handle
+
+    ; Initialize PROCESSENTRY32W.dwSize
+    LEA     RDI, g_PE32W
+    MOV     DWORD PTR [RDI], PE32W_SIZE
+
+    ; Process32FirstW(hSnapshot, &pe)
+    MOV     RCX, RBX
+    LEA     RDX, g_PE32W
+    CALL    Process32FirstW
+    TEST    EAX, EAX
+    JZ      List_CloseSnap
+
+List_NextEntry:
+    ; Append the exe name to outBuffer
+    ; szExeFile is at offset PE32W_EXEFILE_OFF from start of g_PE32W
+    ; It's a WCHAR[260] array
+    LEA     RSI, [g_PE32W + PE32W_EXEFILE_OFF]
+
+    ; Check remaining buffer space before appending
+    ; lstrlenW(outBuffer)
+    MOV     RCX, R12
+    CALL    lstrlenW
+    ; EAX = current length in chars
+    ADD     EAX, 2                 ; Reserve space for separator + null
+    CMP     EAX, R13D
+    JGE     List_CloseSnap         ; Buffer would overflow — stop here
+
+    ; lstrcatW(outBuffer, szExeFile)
+    MOV     RCX, R12
+    MOV     RDX, RSI
+    CALL    lstrcatW
+
+    ; lstrcatW(outBuffer, L";")
+    MOV     RCX, R12
+    LEA     RDX, g_Separator
+    CALL    lstrcatW
+
+    ; Re-initialize pe.dwSize before next call (Process32Next requirement)
+    LEA     RDI, g_PE32W
+    MOV     DWORD PTR [RDI], PE32W_SIZE
+
+    ; Process32NextW(hSnapshot, &pe)
+    MOV     RCX, RBX
+    LEA     RDX, g_PE32W
+    CALL    Process32NextW
+    TEST    EAX, EAX
+    JNZ     List_NextEntry          ; More entries — loop
+
+List_CloseSnap:
+    ; CloseHandle(hSnapshot)
+    MOV     RCX, RBX
+    CALL    CloseHandle
+
+    MOV     RAX, 1
+    JMP     List_Exit
+
+List_Fail:
+    XOR     RAX, RAX
+
+List_Exit:
+    ADD     RSP, 32
+    POP     R13
+    POP     R12
+    POP     RSI
+    POP     RDI
+    POP     RBX
+    RET
+ElleListProcesses ENDP
+
+END

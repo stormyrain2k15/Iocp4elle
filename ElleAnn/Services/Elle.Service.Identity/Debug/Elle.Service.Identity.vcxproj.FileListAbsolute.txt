@@ -1,0 +1,2 @@
+C:\Users\Elle-Ann\Desktop\ElleAnn\Debug\lua54.dll
+C:\Users\Elle-Ann\Desktop\ElleAnn\Debug\ElleAnn.config

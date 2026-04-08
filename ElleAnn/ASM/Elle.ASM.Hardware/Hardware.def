@@ -1,0 +1,10 @@
+; Elle.ASM.Hardware.def — Module Definition File
+; Exports exactly match the function signatures in ElleTypes (Action service typedefs)
+
+LIBRARY ElleASMHardware
+
+EXPORTS
+    ElleVibrateDevice
+    ElleToggleFlash
+    ElleSetCpuAffinity
+    ElleGetSystemLoad

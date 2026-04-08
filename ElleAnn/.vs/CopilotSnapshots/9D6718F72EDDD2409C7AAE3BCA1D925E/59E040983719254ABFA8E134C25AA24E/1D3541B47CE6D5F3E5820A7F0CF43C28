@@ -1,0 +1,140 @@
+﻿#pragma once
+// =============================================================================
+// WSServer.h — WebSocket Server for Elle-Ann (RFC 6455)
+//
+// Handles the WebSocket connection from the Android app.
+// Upgraded from HTTP by HTTPServer when a WebSocket upgrade request arrives.
+//
+// Responsibilities:
+//   - Complete the WebSocket handshake (Sec-WebSocket-Accept computation)
+//   - Maintain the client registry (up to WS_MAX_CLIENTS connections)
+//   - Frame encoding/decoding per RFC 6455
+//   - Ping/pong keepalive at WS_PING_INTERVAL_SEC
+//   - Broadcast messages to all connected clients
+//   - Send messages to a specific client by socket
+//   - Receive and dispatch incoming WebSocket messages from Android
+// =============================================================================
+
+#include "../../Shared/ElleTypes.h"
+#include "../../Shared/ElleConfig.h"
+#include "../../Shared/ElleLogger.h"
+#include <WinSock2.h>
+#include <string>
+#include <vector>
+#include <mutex>
+#include <functional>
+#include <atomic>
+
+#pragma comment(lib, "Ws2_32.lib")
+
+#define WS_LOG(lvl, fmt, ...) ELLE_LOG_##lvl(L"WSServer", fmt, ##__VA_ARGS__)
+
+// WebSocket frame opcodes per RFC 6455
+enum class WSOpcode : uint8_t
+{
+    Continuation    = 0x0,
+    Text            = 0x1,
+    Binary          = 0x2,
+    Close           = 0x8,
+    Ping            = 0x9,
+    Pong            = 0xA
+};
+
+// A decoded WebSocket frame
+struct WSFrame
+{
+    bool        IsFinal;
+    WSOpcode    Opcode;
+    bool        IsMasked;
+    uint8_t     Mask[4];
+    std::string Payload;    // Unmasked payload
+};
+
+// Incoming message callback — called when a text or binary message arrives
+using WSMessageCallback = std::function<void(DWORD clientID, const std::string& message)>;
+
+// Client disconnect callback
+using WSDisconnectCallback = std::function<void(DWORD clientID)>;
+
+// =============================================================================
+// ElleWSServer
+// =============================================================================
+class ElleWSServer
+{
+    ELLE_NONCOPYABLE(ElleWSServer)
+public:
+    ElleWSServer();
+    ~ElleWSServer();
+
+    // Initialize the server (called once)
+    ElleResult Init();
+
+    // Start the ping/keepalive timer thread
+    ElleResult Start();
+
+    // Stop all connections and shut down
+    void Stop();
+
+    // Called by HTTPServer when a WebSocket upgrade is detected.
+    // Completes the handshake and registers the client.
+    // Takes ownership of the socket — do not close it after calling this.
+    ElleResult AcceptUpgrade(SOCKET sock, const std::wstring& secWebSocketKey);
+
+    // Send a UTF-8 text message to all connected clients
+    ElleResult Broadcast(const std::string& message);
+
+    // Send a UTF-8 text message to a specific client by ID
+    ElleResult SendToClient(DWORD clientID, const std::string& message);
+
+    // Disconnect a client cleanly (sends Close frame first)
+    void DisconnectClient(DWORD clientID, uint16_t closeCode = 1000);
+
+    // Register callbacks
+    void SetMessageCallback(WSMessageCallback cb)       { m_MessageCallback = cb; }
+    void SetDisconnectCallback(WSDisconnectCallback cb) { m_DisconnectCallback = cb; }
+
+    int ConnectedCount() const;
+    uint64_t MessagesReceived() const   { return m_MessagesReceived; }
+    uint64_t MessagesSent() const       { return m_MessagesSent; }
+
+private:
+    // Complete the WebSocket upgrade handshake
+    ElleResult SendHandshake(SOCKET sock, const std::wstring& secKey);
+
+    // Compute Sec-WebSocket-Accept value per RFC 6455
+    std::string ComputeAcceptKey(const std::string& clientKey);
+
+    // Receive a single WebSocket frame from a client socket
+    ElleResult ReceiveFrame(SOCKET sock, WSFrame& outFrame);
+
+    // Send a WebSocket frame
+    ElleResult SendFrame(SOCKET sock, WSOpcode opcode, const std::string& payload);
+
+    // Client receive loop — runs on a per-client thread
+    static DWORD WINAPI ClientReadProc(LPVOID param);
+    void ClientReadLoop(ElleWSClient* client);
+
+    // Ping loop — sends pings and drops timed-out clients
+    static DWORD WINAPI PingThreadProc(LPVOID param);
+    void PingLoop();
+
+    // Find client by socket (must hold m_ClientMutex)
+    ElleWSClient* FindClient(SOCKET sock);
+    ElleWSClient* FindClientByID(DWORD id);
+
+    // Remove and free a client slot
+    void RemoveClient(SOCKET sock);
+
+    std::vector<ElleWSClient>   m_Clients;
+    std::mutex                  m_ClientMutex;
+
+    WSMessageCallback           m_MessageCallback;
+    WSDisconnectCallback        m_DisconnectCallback;
+
+    HANDLE                      m_PingThread;
+    HANDLE                      m_StopEvent;
+    volatile bool               m_Running;
+    std::atomic<DWORD>          m_NextClientID;
+    std::atomic<uint64_t>       m_MessagesReceived;
+    std::atomic<uint64_t>       m_MessagesSent;
+};

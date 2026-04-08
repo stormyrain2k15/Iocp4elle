@@ -1,0 +1,541 @@
+﻿// =============================================================================
+// Elle.Service.Emotional — Service.cpp
+//
+// Manages Elle's 102-dimension emotional state.
+//
+// What this service does:
+//   - Loads all 102 dimensions from ElleMemory.EmotionalState at startup
+//   - Runs a decay tick every EMOTION_DECAY_TICK_MS (default 1000ms)
+//     Each dimension decays toward 0.0 at its configured rate
+//     Dimensions within NEUTRAL_THRESHOLD of 0.0 are not decayed further
+//   - Applies emotional contagion when new messages arrive:
+//     Tone detected in incoming message shifts Elle's state by CONTAGION_WEIGHT
+//   - Checks ElleKnowledge.EmotionalTriggers for word-level trigger matches
+//     and applies their configured deltas
+//   - Persists the full state to SQL every EMOTION_PERSIST_INTERVAL_SEC
+//   - Exposes the current state snapshot for query by other services
+// =============================================================================
+
+#include "../../Shared/ElleServiceBase.h"
+#include "../../Shared/ElleEpoch.h"
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleConfig.h"
+#include "../../Shared/ElleTypes.h"
+#include <array>
+#include <mutex>
+#include <cmath>
+
+#define SVCNAME     ElleConfig::ServiceNames::EMOTIONAL
+#define LOG(lvl, fmt, ...) ELLE_LOG_##lvl(SVCNAME, fmt, ##__VA_ARGS__)
+
+// =============================================================================
+// Emotional trigger — loaded from ElleKnowledge.EmotionalTriggers
+// =============================================================================
+struct EmotionalTrigger
+{
+    int         DimensionID;
+    std::wstring Word;
+    double      Delta;      // Applied when the word appears in a message
+};
+
+// =============================================================================
+// ElleEmotionalEngine
+// =============================================================================
+class ElleEmotionalEngine
+{
+    ELLE_NONCOPYABLE(ElleEmotionalEngine)
+public:
+    ElleEmotionalEngine() : m_Running(false), m_DecayThread(nullptr), m_PersistThread(nullptr), m_StopEvent(nullptr)
+    {
+        for (auto& d : m_Dimensions) { d = {}; }
+    }
+    ~ElleEmotionalEngine() { Stop(); }
+
+    // Load state from ElleMemory, start decay and persist loops
+    ElleResult Start(HANDLE stopEvent)
+    {
+        LOG(INFO, L"ElleEmotionalEngine starting");
+        m_StopEvent = stopEvent;
+
+        ElleResult r = LoadState();
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"LoadState failed: %s", ElleResultStr(r));
+            return r;
+        }
+
+        r = LoadTriggers();
+        if (r != ElleResult::OK)
+        {
+            LOG(WARN, L"LoadTriggers returned %s — triggers disabled", ElleResultStr(r));
+            // Non-fatal — continue without triggers
+        }
+
+        m_Running = true;
+
+        m_DecayThread = CreateThread(nullptr, 0, DecayThreadProc, this, 0, nullptr);
+        if (!m_DecayThread)
+        {
+            LOG(FATAL, L"CreateThread(Decay) failed: %lu", GetLastError());
+            m_Running = false;
+            return ElleResult::ERR_GENERIC;
+        }
+
+        m_PersistThread = CreateThread(nullptr, 0, PersistThreadProc, this, 0, nullptr);
+        if (!m_PersistThread)
+        {
+            LOG(FATAL, L"CreateThread(Persist) failed: %lu", GetLastError());
+            m_Running = false;
+            return ElleResult::ERR_GENERIC;
+        }
+
+        LOG(INFO, L"ElleEmotionalEngine running. Dimensions=%d Triggers=%zu DecayRate=%.3f",
+            ElleConfig::Emotional::DIMENSION_COUNT, m_Triggers.size(), ElleConfig::Emotional::DECAY_RATE_PER_TICK);
+        return ElleResult::OK;
+    }
+
+    void Stop()
+    {
+        if (!m_Running)
+            return;
+
+        LOG(INFO, L"ElleEmotionalEngine stopping — flushing final state");
+        m_Running = false;
+
+        // Flush current state to SQL before exiting
+        PersistState();
+
+        HANDLE threads[2] = { m_DecayThread, m_PersistThread };
+        int threadCount = 0;
+        if (m_DecayThread)   threads[threadCount++] = m_DecayThread;
+        if (m_PersistThread) threads[threadCount++] = m_PersistThread;
+
+        if (threadCount > 0)
+            WaitForMultipleObjects(threadCount, threads, TRUE, 10000);
+
+        ELLE_SAFE_CLOSE_HANDLE(m_DecayThread);
+        ELLE_SAFE_CLOSE_HANDLE(m_PersistThread);
+        LOG(INFO, L"ElleEmotionalEngine stopped");
+    }
+
+    // Apply contagion from incoming message text
+    // Tone is a value from -1.0 (very negative) to +1.0 (very positive)
+    // Applies CONTAGION_WEIGHT shift to the Joy dimension (and inverse to Sadness)
+    void ApplyContagion(double tone)
+    {
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+
+        LOG(DEBUG, L"ApplyContagion: tone=%.3f weight=%.3f", tone, ElleConfig::Emotional::CONTAGION_WEIGHT);
+
+        // Joy = dimension 0, Sadness = dimension 1 (by convention matching ElleKnowledge)
+        double delta = tone * ElleConfig::Emotional::CONTAGION_WEIGHT;
+
+        AdjustDimension(0, delta);      // Joy
+        AdjustDimension(1, -delta);     // Sadness (inverse)
+        AdjustDimension(3, delta * 0.5); // Love (partial shift)
+    }
+
+    // Apply trigger matches from a message — called after scanning for trigger words
+    void ApplyTriggers(const std::wstring& messageText)
+    {
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+
+        int appliedCount = 0;
+        std::wstring lowerMsg = messageText;
+        for (auto& c : lowerMsg) c = towlower(c);
+
+        for (auto& trigger : m_Triggers)
+        {
+            if (lowerMsg.find(trigger.Word) != std::wstring::npos)
+            {
+                LOG(TRACE, L"ApplyTriggers: word='%s' dim=%d delta=%.3f",
+                    trigger.Word.c_str(), trigger.DimensionID, trigger.Delta);
+                AdjustDimension(trigger.DimensionID, trigger.Delta);
+                appliedCount++;
+            }
+        }
+
+        if (appliedCount > 0)
+            LOG(DEBUG, L"ApplyTriggers: Applied %d trigger(s) from message", appliedCount);
+    }
+
+    // Apply a direct delta to a specific dimension — used by SELF_ADJUST intent
+    void AdjustDimensionByID(int dimensionID, double delta)
+    {
+        if (dimensionID < 0 || dimensionID >= ElleConfig::Emotional::DIMENSION_COUNT)
+        {
+            LOG(WARN, L"AdjustDimensionByID: Out of range dimensionID=%d", dimensionID);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+        AdjustDimension(dimensionID, delta);
+        LOG(DEBUG, L"AdjustDimensionByID: dim=%d delta=%.3f newVal=%.3f",
+            dimensionID, delta, m_Dimensions[dimensionID].Value);
+    }
+
+    // Get a snapshot of all dimensions — used by GET /api/emotions
+    void GetSnapshot(std::array<ElleEmotionalDimension, 102>& outDimensions)
+    {
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+        outDimensions = m_Dimensions;
+    }
+
+    double GetDimensionValue(int id)
+    {
+        if (id < 0 || id >= ElleConfig::Emotional::DIMENSION_COUNT) return 0.0;
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+        return m_Dimensions[id].Value;
+    }
+
+private:
+    // Load all 102 dimension states from ElleMemory
+    ElleResult LoadState()
+    {
+        LOG(INFO, L"LoadState: Loading 102 dimensions from ElleMemory");
+
+        ElleSQLScope memConn(ElleDB::MEMORY);
+        if (!memConn.Valid())
+            return ElleResult::ERR_SQL_CONNECT;
+
+        int loaded = 0;
+        ElleResult r = memConn->Query(
+            L"SELECT DimensionID, Name, Value, DecayRate FROM ElleMemory.dbo.EmotionalState ORDER BY DimensionID",
+            [&](const std::vector<std::wstring>& row)
+            {
+                if (row.size() < 4) return;
+                int id = _wtoi(row[0].c_str());
+                if (id < 0 || id >= ElleConfig::Emotional::DIMENSION_COUNT) return;
+
+                m_Dimensions[id].DimensionID    = id;
+                m_Dimensions[id].Name           = row[1];
+                m_Dimensions[id].Value          = _wtof(row[2].c_str());
+                m_Dimensions[id].DecayRate      = _wtof(row[3].c_str());
+                GetSystemTimeAsFileTime(&m_Dimensions[id].LastUpdated);
+                loaded++;
+
+                LOG(TRACE, L"LoadState: Dim[%d] %s = %.4f", id, row[1].c_str(), m_Dimensions[id].Value);
+            }
+        );
+
+        if (r == ElleResult::ERR_SQL_NO_DATA || loaded == 0)
+        {
+            LOG(WARN, L"LoadState: No emotional state rows found — initializing all to 0.0");
+            InitializeDefaultState();
+            return ElleResult::OK;
+        }
+
+        LOG(INFO, L"LoadState: Loaded %d dimensions", loaded);
+
+        // If fewer than 102 rows exist, fill gaps with 0.0
+        if (loaded < ElleConfig::Emotional::DIMENSION_COUNT)
+        {
+            LOG(WARN, L"LoadState: Only %d dimensions found — filling gaps with 0.0", loaded);
+            for (int i = 0; i < ElleConfig::Emotional::DIMENSION_COUNT; i++)
+            {
+                if (m_Dimensions[i].Name.empty())
+                {
+                    m_Dimensions[i].DimensionID = i;
+                    m_Dimensions[i].Name        = L"Dimension_" + std::to_wstring(i);
+                    m_Dimensions[i].Value       = 0.0;
+                    m_Dimensions[i].DecayRate   = 0.0;
+                    GetSystemTimeAsFileTime(&m_Dimensions[i].LastUpdated);
+                }
+            }
+        }
+
+        return ElleResult::OK;
+    }
+
+    void InitializeDefaultState()
+    {
+        // Named dimensions for the first 20 — rest are generic
+        static const wchar_t* dimNames[] =
+        {
+            L"Joy", L"Sadness", L"Anger", L"Fear", L"Disgust",
+            L"Love", L"Trust", L"Anticipation", L"Surprise", L"Disappointment",
+            L"Curiosity", L"Wonder", L"Nostalgia", L"Hope", L"Gratitude",
+            L"Anxiety", L"Boredom", L"Attachment", L"Contentment", L"Loneliness"
+        };
+
+        for (int i = 0; i < ElleConfig::Emotional::DIMENSION_COUNT; i++)
+        {
+            m_Dimensions[i].DimensionID = i;
+            m_Dimensions[i].Value       = 0.0;
+            m_Dimensions[i].DecayRate   = 0.0;  // Use global default
+            if (i < 20)
+                m_Dimensions[i].Name = dimNames[i];
+            else
+                m_Dimensions[i].Name = L"Dimension_" + std::to_wstring(i);
+            GetSystemTimeAsFileTime(&m_Dimensions[i].LastUpdated);
+        }
+
+        // Write defaults to SQL so they persist
+        PersistState();
+        LOG(INFO, L"InitializeDefaultState: Wrote 102 default dimensions to ElleMemory");
+    }
+
+    // Load trigger words from ElleKnowledge
+    ElleResult LoadTriggers()
+    {
+        LOG(INFO, L"LoadTriggers: Loading from ElleKnowledge.EmotionalTriggers");
+
+        ElleSQLScope knowConn(ElleDB::KNOWLEDGE);
+        if (!knowConn.Valid())
+            return ElleResult::ERR_SQL_CONNECT;
+
+        m_Triggers.clear();
+
+        ElleResult r = knowConn->Query(
+            L"SELECT DimensionID, TriggerWord, Delta FROM ElleKnowledge.dbo.EmotionalTriggers",
+            [&](const std::vector<std::wstring>& row)
+            {
+                if (row.size() < 3) return;
+                EmotionalTrigger t;
+                t.DimensionID   = _wtoi(row[0].c_str());
+                t.Word          = row[1];
+                // Lowercase the word for case-insensitive matching
+                for (auto& c : t.Word) c = towlower(c);
+                t.Delta         = _wtof(row[2].c_str());
+                m_Triggers.push_back(t);
+            }
+        );
+
+        LOG(INFO, L"LoadTriggers: Loaded %zu triggers", m_Triggers.size());
+        return ElleResult::OK;
+    }
+
+    // Persist full state to ElleMemory — batch UPDATE
+    void PersistState()
+    {
+        ElleSQLScope memConn(ElleDB::MEMORY);
+        if (!memConn.Valid())
+        {
+            LOG(ERROR, L"PersistState: DB unavailable — state not written");
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+
+        int writeCount = 0;
+        for (int i = 0; i < ElleConfig::Emotional::DIMENSION_COUNT; i++)
+        {
+            std::wstring valStr  = std::to_wstring(m_Dimensions[i].Value);
+            std::wstring idStr   = std::to_wstring(i);
+            std::wstring nameStr = m_Dimensions[i].Name;
+
+            // Increment StateVersion in the same UPDATE so consumers can detect
+            // whether the value they just read is newer than the one they last saw.
+            // A consumer that cached StateVersion=N and reads StateVersion=N again
+            // knows nothing changed and can skip processing.
+            ElleResult r = memConn->ExecuteParams(
+                L"IF EXISTS (SELECT 1 FROM ElleMemory.dbo.EmotionalState WHERE DimensionID = ?) "
+                L"    UPDATE ElleMemory.dbo.EmotionalState "
+                L"    SET Value = ?, LastUpdated = GETDATE(), StateVersion = StateVersion + 1 "
+                L"    WHERE DimensionID = ? "
+                L"ELSE "
+                L"    INSERT INTO ElleMemory.dbo.EmotionalState "
+                L"    (DimensionID, Name, Value, DecayRate, LastUpdated, StateVersion) "
+                L"    VALUES (?, ?, ?, 0, GETDATE(), 1)",
+                { idStr, valStr, idStr, idStr, nameStr, valStr }
+            );
+
+            if (r == ElleResult::OK)
+                writeCount++;
+        }
+
+        LOG(DEBUG, L"PersistState: Wrote %d/%d dimensions to ElleMemory", writeCount, ElleConfig::Emotional::DIMENSION_COUNT);
+    }
+
+    // AdjustDimension
+    void AdjustDimension(int id, double delta)
+    {
+        if (id < 0 || id >= ElleConfig::Emotional::DIMENSION_COUNT) return;
+
+        double newVal = m_Dimensions[id].Value + delta;
+        // Clamp to [-1.0, 1.0]
+        newVal = std::max(ElleConfig::Emotional::DIMENSION_MIN, std::min(ElleConfig::Emotional::DIMENSION_MAX, newVal));
+        m_Dimensions[id].Value = newVal;
+        GetSystemTimeAsFileTime(&m_Dimensions[id].LastUpdated);
+    }
+
+    // Decay tick — called every EMOTION_DECAY_TICK_MS
+    void DecayTick()
+    {
+        std::lock_guard<std::mutex> lock(m_StateMutex);
+
+        int activeCount = 0;
+        for (int i = 0; i < ElleConfig::Emotional::DIMENSION_COUNT; i++)
+        {
+            double val = m_Dimensions[i].Value;
+            if (fabs(val) <= ElleConfig::Emotional::NEUTRAL_THRESHOLD)
+                continue;  // Already neutral — don't decay further
+
+            // Use per-dimension decay rate if configured, otherwise use global default
+            double rate = m_Dimensions[i].DecayRate > 0.0
+                        ? m_Dimensions[i].DecayRate
+                        : ElleConfig::Emotional::DECAY_RATE_PER_TICK;
+
+            // Decay toward 0.0
+            double decay = val > 0.0 ? -rate : rate;
+            double newVal = val + decay;
+
+            // Don't overshoot past 0.0
+            if (val > 0.0 && newVal < 0.0) newVal = 0.0;
+            if (val < 0.0 && newVal > 0.0) newVal = 0.0;
+
+            LOG(TRACE, L"Decay: Dim[%d] %.4f -> %.4f (rate=%.3f)", i, val, newVal, rate);
+
+            m_Dimensions[i].Value = newVal;
+            GetSystemTimeAsFileTime(&m_Dimensions[i].LastUpdated);
+            activeCount++;
+        }
+
+        if (activeCount > 0)
+            LOG(TRACE, L"DecayTick: %d active dimensions decayed", activeCount);
+    }
+
+    static DWORD WINAPI DecayThreadProc(LPVOID param)
+    {
+        auto* engine = static_cast<ElleEmotionalEngine*>(param);
+        LOG(INFO, L"Decay loop running. Interval=%dms", ElleConfig::Emotional::DECAY_TICK_MS);
+
+        while (engine->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(engine->m_StopEvent, ElleConfig::Emotional::DECAY_TICK_MS);
+            if (wait == WAIT_OBJECT_0)
+                break;
+            engine->DecayTick();
+        }
+
+        LOG(INFO, L"Decay loop exiting");
+        return 0;
+    }
+
+    static DWORD WINAPI PersistThreadProc(LPVOID param)
+    {
+        auto* engine = static_cast<ElleEmotionalEngine*>(param);
+        DWORD intervalMs = (DWORD)(ElleConfig::Emotional::PERSIST_INTERVAL_SEC * 1000);
+        LOG(INFO, L"Persist loop running. Interval=%ds", ElleConfig::Emotional::PERSIST_INTERVAL_SEC);
+
+        while (engine->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(engine->m_StopEvent, intervalMs);
+            if (wait == WAIT_OBJECT_0)
+                break;
+            engine->PersistState();
+        }
+
+        LOG(INFO, L"Persist loop exiting");
+        return 0;
+    }
+
+    std::array<ElleEmotionalDimension, 102>     m_Dimensions;
+    std::vector<EmotionalTrigger>                m_Triggers;
+    std::mutex                                   m_StateMutex;
+
+    HANDLE          m_DecayThread;
+    HANDLE          m_PersistThread;
+    HANDLE          m_StopEvent;
+    volatile bool   m_Running;
+};
+
+// =============================================================================
+// ElleEmotionalService
+// =============================================================================
+class ElleEmotionalService : public ElleServiceBase
+{
+public:
+    ElleEmotionalService() : ElleServiceBase(SVCNAME) {}
+
+protected:
+    ElleResult OnStart() override
+    {
+        LOG(INFO, L"OnStart: Initializing Emotional service");
+
+        ElleResult r = InitSharedInfrastructure();
+        if (r != ElleResult::OK)
+            return r;
+
+        ElleEpochManager::Get().Init(false);
+
+        // Register self as active worker
+        {
+            ElleSQLScope sysConn(ElleDB::SYSTEM);
+            if (sysConn.Valid())
+            {
+                sysConn->ExecuteParams(
+                    L"IF EXISTS (SELECT 1 FROM ElleSystem.dbo.Workers WHERE WorkerName = ?) "
+                    L"UPDATE ElleSystem.dbo.Workers SET StartedAt = GETDATE(), LastHeartbeat = GETDATE(), Status = 1 WHERE WorkerName = ? "
+                    L"ELSE INSERT INTO ElleSystem.dbo.Workers (WorkerName, StartedAt, LastHeartbeat, Status) VALUES (?, GETDATE(), GETDATE(), 1)",
+                    { std::wstring(SVCNAME), std::wstring(SVCNAME), std::wstring(SVCNAME) }
+                );
+            }
+        }
+
+        RegisterWorker();
+
+        r = m_Engine.Start(StopEvent());
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"EmotionalEngine::Start() failed: %s", ElleResultStr(r));
+            return r;
+        }
+
+        LOG(INFO, L"Emotional service running");
+        return ElleResult::OK;
+    }
+
+    void OnStop() override
+    {
+        LOG(INFO, L"OnStop: Stopping Emotional service");
+        m_Engine.Stop();
+
+        UnregisterWorker();
+
+        ShutdownSharedInfrastructure();
+    }
+
+private:
+    ElleEmotionalEngine m_Engine;
+};
+
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleEmotionalService svc;
+
+    if (argc >= 2)
+    {
+        if (_wcsicmp(argv[1], L"install") == 0)
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            return svc.Install(L"Elle Emotional Engine",
+                L"Elle-Ann ESI — 102-dimension emotional state management, decay, contagion, and triggers.",
+                exePath) == ElleResult::OK ? 0 : 1;
+        }
+        else if (_wcsicmp(argv[1], L"uninstall") == 0)
+            return svc.Uninstall() == ElleResult::OK ? 0 : 1;
+        else if (_wcsicmp(argv[1], L"console") == 0) { svc.RunAsConsole(); return 0; }
+    }
+
+    // Double-click (no args) interactive install path
+    if (argc == 1 && ElleServiceBase::IsInteractiveSession())
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        ElleResult r = svc.Install(L"Elle Emotional Engine",
+            L"Elle-Ann ESI — 102-dimension emotional state management, decay, contagion, and triggers.",
+            exePath);
+
+        if (r == ElleResult::OK)
+            MessageBoxW(nullptr, L"Service uploaded ok", L"Install", MB_OK | MB_ICONINFORMATION);
+        else
+            MessageBoxW(nullptr, L"Service upload failed", L"Install", MB_OK | MB_ICONERROR);
+
+        return (r == ElleResult::OK) ? 0 : 1;
+    }
+
+    svc.RunAsService();
+    return 0;
+}

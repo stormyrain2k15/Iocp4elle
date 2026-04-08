@@ -1,0 +1,8 @@
+; Elle.ASM.Process.def
+
+LIBRARY ElleASMProcess
+
+EXPORTS
+    ElleLaunchProcess
+    ElleKillProcess
+    ElleListProcesses

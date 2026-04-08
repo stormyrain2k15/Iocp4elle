@@ -1,0 +1,530 @@
+﻿// =============================================================================
+// ElleServiceBase.cpp — Implementation
+// =============================================================================
+
+#include "ElleServiceBase.h"
+#include <cstdio>
+#include <winternl.h>
+
+ElleServiceBase* ElleServiceBase::s_Instance = nullptr;
+
+// Helper: determine whether this process is running in an interactive (desktop)
+// session. Services run in Session 0; interactive users are in the active
+// console session. We treat equality with WTSGetActiveConsoleSessionId() as
+// an indicator that the process was started by a user (double-click / cmd).
+bool ElleServiceBase::IsInteractiveSession()
+{
+    DWORD sid = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &sid))
+        return false;
+    DWORD active = WTSGetActiveConsoleSessionId();
+    return (sid == active);
+}
+
+// =============================================================================
+// Constructor / Destructor
+// =============================================================================
+ElleServiceBase::ElleServiceBase(const std::wstring& serviceName)
+    : m_ServiceName(serviceName)
+    , m_StatusHandle(nullptr)
+    , m_State(ElleServiceState::STOPPED)
+    , m_StopEvent(nullptr)
+{
+    ZeroMemory(&m_Status, sizeof(m_Status));
+    m_Status.dwServiceType              = SERVICE_WIN32_OWN_PROCESS;
+    m_Status.dwCurrentState             = SERVICE_STOPPED;
+    m_Status.dwControlsAccepted         = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PAUSE_CONTINUE;
+    m_Status.dwWin32ExitCode            = NO_ERROR;
+    m_Status.dwServiceSpecificExitCode  = 0;
+    m_Status.dwCheckPoint               = 0;
+    m_Status.dwWaitHint                 = 0;
+
+    s_Instance = this;
+}
+
+ElleServiceBase::~ElleServiceBase()
+{
+    ELLE_SAFE_CLOSE_HANDLE(m_StopEvent);
+    s_Instance = nullptr;
+}
+
+// =============================================================================
+// RunAsService — SCM dispatch path
+// =============================================================================
+void ElleServiceBase::RunAsService()
+{
+    SERVICE_TABLE_ENTRYW dispatchTable[] =
+    {
+        { (LPWSTR)m_ServiceName.c_str(), ServiceMain },
+        { nullptr, nullptr }
+    };
+
+    if (!StartServiceCtrlDispatcherW(dispatchTable))
+    {
+        DWORD err = GetLastError();
+        // If ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, we're not running under SCM
+        // This is expected when launched from command line without args — just log and exit
+        if (err != ERROR_FAILED_SERVICE_CONTROLLER_CONNECT)
+        {
+            ELLE_LOG_WIN32(L"ServiceBase", L"StartServiceCtrlDispatcher failed", err);
+        }
+    }
+}
+
+// =============================================================================
+// RunAsConsole — debug/development path
+// =============================================================================
+void ElleServiceBase::RunAsConsole()
+{
+    wprintf(L"[%s] Starting in console mode. Press Ctrl+C to stop.\n", m_ServiceName.c_str());
+
+    m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!m_StopEvent)
+    {
+        ELLE_LOG_WIN32(L"ServiceBase", L"CreateEvent(StopEvent) failed", GetLastError());
+        return;
+    }
+
+    // Install Ctrl+C handler
+    SetConsoleCtrlHandler([](DWORD ctrlType) -> BOOL
+    {
+        if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT)
+        {
+            wprintf(L"\n[Elle] Shutdown signal received\n");
+            if (s_Instance && s_Instance->m_StopEvent)
+                SetEvent(s_Instance->m_StopEvent);
+            return TRUE;
+        }
+        return FALSE;
+    }, TRUE);
+
+    m_State = ElleServiceState::RUNNING;
+
+    ElleResult r = OnStart();
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_FATAL(L"ServiceBase", L"OnStart() failed: %s — exiting", ElleResultStr(r));
+        return;
+    }
+
+    wprintf(L"[%s] Running. Ctrl+C to stop.\n", m_ServiceName.c_str());
+    WaitForSingleObject(m_StopEvent, INFINITE);
+
+    wprintf(L"[%s] Stopping...\n", m_ServiceName.c_str());
+    m_State = ElleServiceState::STOPPING;
+    OnStop();
+    m_State = ElleServiceState::STOPPED;
+    wprintf(L"[%s] Stopped.\n", m_ServiceName.c_str());
+}
+
+// =============================================================================
+// ServiceMain — called by SCM on a new thread when the service starts
+// =============================================================================
+void WINAPI ElleServiceBase::ServiceMain(DWORD argc, LPWSTR* argv)
+{
+    if (!s_Instance)
+        return;
+
+    ElleServiceBase* svc = s_Instance;
+
+    // Register the control handler
+    svc->m_StatusHandle = RegisterServiceCtrlHandlerExW(
+        svc->m_ServiceName.c_str(),
+        ServiceCtrlHandlerEx,
+        svc
+    );
+
+    if (!svc->m_StatusHandle)
+    {
+        ELLE_LOG_WIN32(L"ServiceBase", L"RegisterServiceCtrlHandlerEx failed", GetLastError());
+        return;
+    }
+
+    // Create the stop event
+    svc->m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!svc->m_StopEvent)
+    {
+        ELLE_LOG_WIN32(L"ServiceBase", L"CreateEvent(StopEvent) failed", GetLastError());
+        svc->ReportStopped(GetLastError());
+        return;
+    }
+
+    svc->ReportStartPending(5000);
+    svc->m_State = ElleServiceState::STARTING;
+
+    ELLE_LOG_INFO(L"ServiceBase", L"Service starting: %s", svc->m_ServiceName.c_str());
+
+    ElleResult r = svc->OnStart();
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_FATAL(L"ServiceBase", L"OnStart() returned %s — service cannot start",
+            ElleResultStr(r));
+        svc->m_State = ElleServiceState::FAULTED;
+        svc->ReportStopped(ERROR_SERVICE_SPECIFIC_ERROR);
+        return;
+    }
+
+    svc->ReportRunning();
+    svc->m_State = ElleServiceState::RUNNING;
+    ELLE_LOG_INFO(L"ServiceBase", L"Service running: %s", svc->m_ServiceName.c_str());
+
+    // Wait until stop is signaled by SCM
+    WaitForSingleObject(svc->m_StopEvent, INFINITE);
+
+    ELLE_LOG_INFO(L"ServiceBase", L"Service stopping: %s", svc->m_ServiceName.c_str());
+    svc->ReportStopPending(10000);
+    svc->m_State = ElleServiceState::STOPPING;
+
+    svc->OnStop();
+
+    svc->m_State = ElleServiceState::STOPPED;
+    svc->ReportStopped(NO_ERROR);
+    ELLE_LOG_INFO(L"ServiceBase", L"Service stopped: %s", svc->m_ServiceName.c_str());
+}
+
+// =============================================================================
+// ServiceCtrlHandlerEx — receives control codes from SCM
+// =============================================================================
+DWORD WINAPI ElleServiceBase::ServiceCtrlHandlerEx(
+    DWORD   control,
+    DWORD   eventType,
+    LPVOID  eventData,
+    LPVOID  context)
+{
+    ElleServiceBase* svc = static_cast<ElleServiceBase*>(context);
+    if (!svc)
+        return ERROR_CALL_NOT_IMPLEMENTED;
+
+    switch (control)
+    {
+        case SERVICE_CONTROL_STOP:
+            ELLE_LOG_INFO(L"ServiceBase", L"SCM sent STOP to %s", svc->m_ServiceName.c_str());
+            svc->ReportStopPending(10000);
+            SetEvent(svc->m_StopEvent);
+            return NO_ERROR;
+
+        case SERVICE_CONTROL_PAUSE:
+            ELLE_LOG_INFO(L"ServiceBase", L"SCM sent PAUSE to %s", svc->m_ServiceName.c_str());
+            svc->ReportPaused();
+            svc->m_State = ElleServiceState::PAUSED;
+            svc->OnPause();
+            return NO_ERROR;
+
+        case SERVICE_CONTROL_CONTINUE:
+            ELLE_LOG_INFO(L"ServiceBase", L"SCM sent CONTINUE to %s", svc->m_ServiceName.c_str());
+            svc->OnContinue();
+            svc->m_State = ElleServiceState::RUNNING;
+            svc->ReportRunning();
+            return NO_ERROR;
+
+        case SERVICE_CONTROL_INTERROGATE:
+            // SCM is asking for current status — SetStatus with current state
+            svc->SetStatus(svc->m_Status.dwCurrentState);
+            return NO_ERROR;
+
+        case SERVICE_CONTROL_SHUTDOWN:
+            ELLE_LOG_WARN(L"ServiceBase", L"System shutdown — stopping %s", svc->m_ServiceName.c_str());
+            SetEvent(svc->m_StopEvent);
+            return NO_ERROR;
+
+        default:
+            return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+}
+
+// =============================================================================
+// Status reporting
+// =============================================================================
+void ElleServiceBase::SetStatus(DWORD state, DWORD waitHint, DWORD exitCode)
+{
+    static DWORD checkpoint = 1;
+
+    m_Status.dwCurrentState     = state;
+    m_Status.dwWaitHint         = waitHint;
+    m_Status.dwWin32ExitCode    = exitCode;
+
+    if (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING)
+        m_Status.dwCheckPoint = checkpoint++;
+    else
+        m_Status.dwCheckPoint = 0;
+
+    // Controls accepted — can't accept stop while starting
+    if (state == SERVICE_START_PENDING)
+        m_Status.dwControlsAccepted = 0;
+    else
+        m_Status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PAUSE_CONTINUE;
+
+    if (m_StatusHandle)
+        SetServiceStatus(m_StatusHandle, &m_Status);
+}
+
+void ElleServiceBase::ReportStartPending(DWORD waitHintMs)
+{
+    SetStatus(SERVICE_START_PENDING, waitHintMs);
+}
+
+void ElleServiceBase::ReportStopPending(DWORD waitHintMs)
+{
+    SetStatus(SERVICE_STOP_PENDING, waitHintMs);
+}
+
+void ElleServiceBase::ReportRunning()
+{
+    SetStatus(SERVICE_RUNNING);
+}
+
+void ElleServiceBase::ReportPaused()
+{
+    SetStatus(SERVICE_PAUSED);
+}
+
+void ElleServiceBase::ReportStopped(DWORD exitCode)
+{
+    SetStatus(SERVICE_STOPPED, 0, exitCode);
+}
+
+// =============================================================================
+// Shared infrastructure init/shutdown
+// =============================================================================
+ElleResult ElleServiceBase::InitSharedInfrastructure()
+{
+    // Load config file FIRST — overrides compile-time defaults in ElleConfig.h.
+    // Path: C:\Elle\ElleAnn.config
+    // If the file doesn't exist or a key is missing, the default from ElleConfig.h is used.
+    // Edit ElleAnn.config and change DB_SERVER to match your SQL Server instance name.
+    ElleConfigReader::Get().Load();
+
+    // Build logger SQL connection string using the config-file server name
+    std::wstring sqlConnStr = ElleConfigReader::Get().BuildConnStr(
+        std::wstring(ElleConfig::DB::DB_SYSTEM));
+
+    // Enable console logging automatically when running interactively
+    DWORD targets = ElleConfig::Log::DEFAULT_TARGETS;
+    if (IsInteractiveSession() || GetConsoleWindow() != nullptr)
+    {
+        targets |= ElleConfig::Log::TARGET_CONSOLE | ElleConfig::Log::TARGET_DEBUGGER;
+    }
+
+    ElleResult r = ElleLogger::Get().Init(
+        m_ServiceName,
+        targets,
+        static_cast<ElleLogLevel>(ElleConfig::Log::DEFAULT_LEVEL),
+        sqlConnStr
+    );
+
+    if (r != ElleResult::OK)
+    {
+        OutputDebugStringW(L"[ELLE][FATAL] Logger init failed\n");
+        return r;
+    }
+
+    ELLE_LOG_INFO(m_ServiceName.c_str(),
+        L"Logger initialized. DB_SERVER=%s — initializing SQL pool...",
+        ElleConfigReader::Get().Server().c_str());
+
+    r = ElleSQLPool::Get().Init(ElleConfigReader::Get().Server());
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_FATAL(m_ServiceName.c_str(), L"SQL pool init failed — service cannot start");
+        return r;
+    }
+
+    ELLE_LOG_INFO(m_ServiceName.c_str(), L"Shared infrastructure ready");
+    return ElleResult::OK;
+}
+
+
+void ElleServiceBase::ShutdownSharedInfrastructure()
+{
+    ELLE_LOG_INFO(m_ServiceName.c_str(), L"Shutting down shared infrastructure");
+    ElleSQLPool::Get().Shutdown();
+    ElleLogger::Get().Shutdown();
+}
+
+// =============================================================================
+// Install / Uninstall
+// =============================================================================
+ElleResult ElleServiceBase::Install(
+    const std::wstring& displayName,
+    const std::wstring& description,
+    const std::wstring& exePath)
+{
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCM)
+    {
+        wprintf(L"[INSTALL] OpenSCManager failed: %lu\n", GetLastError());
+        return ElleResult::ERR_GENERIC;
+    }
+
+    SC_HANDLE hSvc = CreateServiceW(
+        hSCM,
+        m_ServiceName.c_str(),
+        displayName.c_str(),
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL,
+        exePath.c_str(),
+        nullptr,    // load order group
+        nullptr,    // tag ID
+        nullptr,    // dependencies
+        nullptr,    // LocalSystem account
+        nullptr     // no password
+    );
+
+    if (!hSvc)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_EXISTS)
+            wprintf(L"[INSTALL] Service already exists: %s\n", m_ServiceName.c_str());
+        else
+            wprintf(L"[INSTALL] CreateService failed: %lu\n", err);
+        CloseServiceHandle(hSCM);
+        return ElleResult::ERR_GENERIC;
+    }
+
+    // Set description
+    SERVICE_DESCRIPTIONW svcDesc;
+    svcDesc.lpDescription = (LPWSTR)description.c_str();
+    ChangeServiceConfig2W(hSvc, SERVICE_CONFIG_DESCRIPTION, &svcDesc);
+
+    // Configure failure actions — restart on failure up to 3 times
+    SC_ACTION actions[3] =
+    {
+        { SC_ACTION_RESTART, 5000  },   // 5s delay on first failure
+        { SC_ACTION_RESTART, 10000 },   // 10s on second
+        { SC_ACTION_RESTART, 30000 }    // 30s on third
+    };
+    SERVICE_FAILURE_ACTIONSW failureActions = {};
+    failureActions.dwResetPeriod    = 86400;    // Reset failure count after 1 day
+    failureActions.cActions         = 3;
+    failureActions.lpsaActions      = actions;
+    ChangeServiceConfig2W(hSvc, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions);
+
+    wprintf(L"[INSTALL] Service installed: %s\n", m_ServiceName.c_str());
+    wprintf(L"[INSTALL] Path: %s\n", exePath.c_str());
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
+    return ElleResult::OK;
+}
+
+ElleResult ElleServiceBase::Uninstall()
+{
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hSCM)
+    {
+        wprintf(L"[UNINSTALL] OpenSCManager failed: %lu\n", GetLastError());
+        return ElleResult::ERR_GENERIC;
+    }
+
+    SC_HANDLE hSvc = OpenServiceW(hSCM, m_ServiceName.c_str(), SERVICE_STOP | DELETE);
+    if (!hSvc)
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST)
+            wprintf(L"[UNINSTALL] Service not found: %s\n", m_ServiceName.c_str());
+        else
+            wprintf(L"[UNINSTALL] OpenService failed: %lu\n", err);
+        CloseServiceHandle(hSCM);
+        return ElleResult::ERR_GENERIC;
+    }
+
+    // Attempt to stop it first
+    SERVICE_STATUS status = {};
+    ControlService(hSvc, SERVICE_CONTROL_STOP, &status);
+    Sleep(2000);
+
+    if (!DeleteService(hSvc))
+    {
+        wprintf(L"[UNINSTALL] DeleteService failed: %lu\n", GetLastError());
+        CloseServiceHandle(hSvc);
+        CloseServiceHandle(hSCM);
+        return ElleResult::ERR_GENERIC;
+    }
+
+    wprintf(L"[UNINSTALL] Service removed: %s\n", m_ServiceName.c_str());
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// RegisterWorker — UPSERT this service into ElleSystem.Workers with epoch
+// =============================================================================
+ElleResult ElleServiceBase::RegisterWorker()
+{
+    ElleSQLScope sysConn(ElleDB::SYSTEM);
+    if (!sysConn.Valid())
+    {
+        ELLE_LOG_ERROR(m_ServiceName.c_str(),
+            L"RegisterWorker: cannot connect to ElleSystem");
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    const std::wstring& epoch = ElleEpochManager::Get().CurrentEpoch();
+
+    ElleResult r = sysConn->ExecuteParams(
+        L"IF EXISTS (SELECT 1 FROM ElleSystem.dbo.Workers WHERE WorkerName = ?) "
+        L"    UPDATE ElleSystem.dbo.Workers "
+        L"    SET Status = 1, StartedAt = GETDATE(), LastHeartbeat = GETDATE(), LastEpochID = ? "
+        L"    WHERE WorkerName = ? "
+        L"ELSE "
+        L"    INSERT INTO ElleSystem.dbo.Workers "
+        L"    (WorkerName, Status, StartedAt, LastHeartbeat, LastEpochID) "
+        L"    VALUES (?, 1, GETDATE(), GETDATE(), ?)",
+        { m_ServiceName, epoch, m_ServiceName, m_ServiceName, epoch }
+    );
+
+    if (r != ElleResult::OK)
+    {
+        ELLE_LOG_ERROR(m_ServiceName.c_str(),
+            L"RegisterWorker: DB write failed: %s", sysConn->LastError.c_str());
+    }
+    else
+    {
+        ELLE_LOG_INFO(m_ServiceName.c_str(),
+            L"RegisterWorker: Registered in ElleSystem.Workers. Epoch=%s", epoch.c_str());
+    }
+
+    return r;
+}
+
+// =============================================================================
+// UnregisterWorker — mark this service stopped in ElleSystem.Workers
+// =============================================================================
+void ElleServiceBase::UnregisterWorker()
+{
+    ElleSQLScope sysConn(ElleDB::SYSTEM);
+    if (!sysConn.Valid())
+    {
+        ELLE_LOG_WARN(m_ServiceName.c_str(),
+            L"UnregisterWorker: cannot connect to ElleSystem — status not updated");
+        return;
+    }
+
+    ElleResult r = sysConn->ExecuteParams(
+        L"UPDATE ElleSystem.dbo.Workers SET Status = 0, StoppedAt = GETDATE() WHERE WorkerName = ?",
+        { m_ServiceName }
+    );
+
+    if (r != ElleResult::OK)
+        ELLE_LOG_WARN(m_ServiceName.c_str(), L"UnregisterWorker: DB write failed: %s",
+            sysConn->LastError.c_str());
+    else
+        ELLE_LOG_INFO(m_ServiceName.c_str(), L"UnregisterWorker: Marked stopped in ElleSystem.Workers");
+}
+
+// =============================================================================
+// TouchHeartbeat — update LastHeartbeat for this service
+// =============================================================================
+void ElleServiceBase::TouchHeartbeat()
+{
+    ElleSQLScope sysConn(ElleDB::SYSTEM);
+    if (!sysConn.Valid()) return;
+
+    sysConn->ExecuteParams(
+        L"UPDATE ElleSystem.dbo.Workers SET LastHeartbeat = GETDATE() WHERE WorkerName = ?",
+        { m_ServiceName }
+    );
+}

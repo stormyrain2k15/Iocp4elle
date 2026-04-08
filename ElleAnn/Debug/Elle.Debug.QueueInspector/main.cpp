@@ -1,0 +1,405 @@
+// =============================================================================
+// Elle.Debug.QueueInspector — main.cpp
+//
+// Live console-based inspector for IntentQueue and ActionQueue.
+// Polls every second and prints a readable view of all rows.
+// Lets you inject test intents from the command line without needing
+// the Android app or the C++ core to be running.
+//
+// Usage:
+//   QueueInspector.exe                  (live view, refreshes every 1s)
+//   QueueInspector.exe inject EXPLORE   (inject one EXPLORE intent)
+//   QueueInspector.exe inject CHECK_IN
+//   QueueInspector.exe inject SEND_NOTIFY "{\"title\":\"Test\",\"message\":\"Hello\"}"
+//   QueueInspector.exe inject EXECUTE_COMMAND "{\"command\":\"vibrate\"}"
+//   QueueInspector.exe inject EMOTION_SYNC "{\"tone\":0.8}"
+//   QueueInspector.exe inject SELF_PROMPT "{\"trigger\":\"debug\"}"
+//   QueueInspector.exe clear intents    (DELETE all from IntentQueue)
+//   QueueInspector.exe clear actions    (DELETE all from ActionQueue)
+//   QueueInspector.exe stats            (print queue stats and exit)
+// =============================================================================
+
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleTypes.h"
+#include "../../Shared/ElleConfig.h"
+#include "../../Shared/ElleConfigReader.h"
+#include <cstdio>
+#include <map>
+
+#define QI_LOG(lvl, fmt, ...) ELLE_LOG_##lvl(L"QueueInspector", fmt, ##__VA_ARGS__)
+
+// Intent type name lookup
+static const wchar_t* IntentTypeName(int typeID)
+{
+    switch (typeID)
+    {
+        case 0:  return L"UNKNOWN";
+        case 1:  return L"EXPLORE";
+        case 2:  return L"CHECK_IN";
+        case 3:  return L"SELF_ADJUST";
+        case 4:  return L"IDLE";
+        case 5:  return L"MEMORY_RECALL";
+        case 6:  return L"EMOTION_SYNC";
+        case 7:  return L"SEND_NOTIFY";
+        case 8:  return L"SEND_MESSAGE";
+        case 9:  return L"EXECUTE_COMMAND";
+        case 10: return L"LUA_SCRIPT";
+        case 11: return L"SELF_PROMPT";
+        case 12: return L"HEARTBEAT";
+        default: return L"CUSTOM";
+    }
+}
+
+static const wchar_t* IntentStatusName(int statusID)
+{
+    switch (statusID)
+    {
+        case 0: return L"PENDING";
+        case 1: return L"PROCESSING";
+        case 2: return L"COMPLETED";
+        case 3: return L"FAILED";
+        case 4: return L"STALE";
+        case 5: return L"CANCELLED";
+        default: return L"UNKNOWN";
+    }
+}
+
+static const wchar_t* ActionTypeName(int typeID)
+{
+    switch (typeID)
+    {
+        case 1:  return L"VIBRATE";
+        case 2:  return L"FLASH";
+        case 3:  return L"NOTIFY";
+        case 4:  return L"OPEN_APP";
+        case 7:  return L"SAVE_MEMORY";
+        case 8:  return L"READ_MEMORY";
+        case 9:  return L"WRITE_FILE";
+        case 10: return L"READ_FILE";
+        case 11: return L"EXEC_PROCESS";
+        case 12: return L"KILL_PROCESS";
+        case 14: return L"GET_SYSTEM_INFO";
+        case 15: return L"SET_CPU_AFFINITY";
+        case 16: return L"WS_BROADCAST";
+        case 17: return L"WS_SEND";
+        default: return L"CUSTOM";
+    }
+}
+
+static const wchar_t* ActionStatusName(int statusID)
+{
+    switch (statusID)
+    {
+        case 0: return L"PENDING";
+        case 1: return L"LOCKED";
+        case 2: return L"SUCCESS";
+        case 3: return L"FAILED";
+        case 4: return L"TIMEOUT";
+        default: return L"UNKNOWN";
+    }
+}
+
+// Map string names to intent TypeIDs for inject command
+static const std::map<std::wstring, int> INTENT_NAME_MAP =
+{
+    { L"EXPLORE",           1 },
+    { L"CHECK_IN",          2 },
+    { L"SELF_ADJUST",       3 },
+    { L"IDLE",              4 },
+    { L"MEMORY_RECALL",     5 },
+    { L"EMOTION_SYNC",      6 },
+    { L"SEND_NOTIFY",       7 },
+    { L"SEND_MESSAGE",      8 },
+    { L"EXECUTE_COMMAND",   9 },
+    { L"LUA_SCRIPT",       10 },
+    { L"SELF_PROMPT",      11 },
+    { L"HEARTBEAT",        12 },
+};
+
+// =============================================================================
+// Print current queue state
+// =============================================================================
+static void PrintQueues()
+{
+    system("cls");  // Clear console
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    wprintf(L"=== ElleAnn Queue Inspector  %02d:%02d:%02d ===\n\n",
+        now.wHour, now.wMinute, now.wSecond);
+
+    ElleSQLScope coreConn(ElleDB::CORE);
+    if (!coreConn.Valid())
+    {
+        wprintf(L"[ERROR] Cannot connect to ElleCore database\n");
+        return;
+    }
+
+    // ---- IntentQueue ----
+    wprintf(L"INTENT QUEUE\n");
+    wprintf(L"%-10s  %-18s  %-12s  %-5s  %-30s  %-20s\n",
+        L"IntentID", L"Type", L"Status", L"Pri", L"Data (truncated)", L"Response (truncated)");
+    wprintf(L"%-10s  %-18s  %-12s  %-5s  %-30s  %-20s\n",
+        L"----------", L"------------------", L"------------", L"-----",
+        L"------------------------------", L"--------------------");
+
+    int intentCount = 0;
+    coreConn->Query(
+        L"SELECT TOP 20 IntentID, TypeID, StatusID, Priority, IntentData, Response "
+        L"FROM ElleCore.dbo.IntentQueue "
+        L"ORDER BY IntentID DESC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 6) return;
+            int typeID      = _wtoi(row[1].c_str());
+            int statusID    = _wtoi(row[2].c_str());
+
+            // Truncate data and response for display
+            std::wstring data     = row[4].size() > 30 ? row[4].substr(0, 27) + L"..." : row[4];
+            std::wstring response = row[5].size() > 20 ? row[5].substr(0, 17) + L"..." : row[5];
+
+            wprintf(L"%-10s  %-18s  %-12s  %-5s  %-30s  %-20s\n",
+                row[0].c_str(),
+                IntentTypeName(typeID),
+                IntentStatusName(statusID),
+                row[3].c_str(),
+                data.c_str(),
+                response.c_str()
+            );
+            intentCount++;
+        }
+    );
+
+    if (intentCount == 0)
+        wprintf(L"  (empty)\n");
+
+    // Summary counts
+    int pending = 0, processing = 0, completed = 0, failed = 0;
+    coreConn->Query(
+        L"SELECT StatusID, COUNT(*) FROM ElleCore.dbo.IntentQueue GROUP BY StatusID",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 2)
+                return;
+            int s = _wtoi(row[0].c_str());
+            int c = _wtoi(row[1].c_str());
+            if (s == 0) pending    = c;
+            if (s == 1) processing = c;
+            if (s == 2) completed  = c;
+            if (s == 3) failed     = c;
+        }
+    );
+    wprintf(L"\n  PENDING=%d  PROCESSING=%d  COMPLETED=%d  FAILED=%d\n\n",
+        pending, processing, completed, failed);
+
+    // ---- ActionQueue ----
+    wprintf(L"ACTION QUEUE\n");
+    wprintf(L"%-10s  %-10s  %-18s  %-10s  %-30s\n",
+        L"ActionID", L"IntentID", L"Type", L"Status", L"Data (truncated)");
+    wprintf(L"%-10s  %-10s  %-18s  %-10s  %-30s\n",
+        L"----------", L"----------", L"------------------", L"----------",
+        L"------------------------------");
+
+    int actionCount = 0;
+    coreConn->Query(
+        L"SELECT TOP 20 ActionID, SourceIntentID, TypeID, StatusID, ActionData "
+        L"FROM ElleCore.dbo.ActionQueue "
+        L"ORDER BY ActionID DESC",
+        [&](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 5) return;
+            int typeID   = _wtoi(row[2].c_str());
+            int statusID = _wtoi(row[3].c_str());
+            std::wstring data = row[4].size() > 30 ? row[4].substr(0, 27) + L"..." : row[4];
+
+            wprintf(L"%-10s  %-10s  %-18s  %-10s  %-30s\n",
+                row[0].c_str(),
+                row[1].c_str(),
+                ActionTypeName(typeID),
+                ActionStatusName(statusID),
+                data.c_str()
+            );
+            actionCount++;
+        }
+    );
+
+    if (actionCount == 0)
+        wprintf(L"  (empty)\n");
+
+    wprintf(L"\n  Press Ctrl+C to exit  |  Run with 'inject <TYPE> [data]' to push a test intent\n");
+}
+
+// =============================================================================
+// Inject a test intent
+// =============================================================================
+static void InjectIntent(const std::wstring& typeName, const std::wstring& data)
+{
+    auto it = INTENT_NAME_MAP.find(typeName);
+    if (it == INTENT_NAME_MAP.end())
+    {
+        wprintf(L"[ERROR] Unknown intent type: %s\n", typeName.c_str());
+        wprintf(L"Valid types: EXPLORE CHECK_IN SELF_ADJUST MEMORY_RECALL EMOTION_SYNC SEND_NOTIFY SEND_MESSAGE EXECUTE_COMMAND SELF_PROMPT HEARTBEAT\n");
+        return;
+    }
+
+    int typeID = it->second;
+    std::wstring payload = data.empty() ? L"{\"source\":\"debug_inject\"}" : data;
+
+    ElleSQLScope coreConn(ElleDB::CORE);
+    if (!coreConn.Valid())
+    {
+        wprintf(L"[ERROR] Cannot connect to ElleCore\n");
+        return;
+    }
+
+    ElleResult r = coreConn->ExecuteParams(
+        L"INSERT INTO ElleCore.dbo.IntentQueue (TypeID, StatusID, IntentData, TrustRequired, Priority, CreatedAt) "
+        L"VALUES (?, 0, ?, 0, 10, GETDATE())",
+        { std::to_wstring(typeID), payload }
+    );
+
+    if (r == ElleResult::OK)
+    {
+        int64_t id = 0;
+        coreConn->Query(L"SELECT SCOPE_IDENTITY()",
+            [&](const std::vector<std::wstring>& row) { if (!row.empty()) id = _wtoi64(row[0].c_str()); });
+
+        wprintf(L"[OK] Injected %s IntentID=%lld Data=%s\n",
+            typeName.c_str(), id, payload.c_str());
+    }
+    else
+    {
+        wprintf(L"[ERROR] Insert failed: %s\n", coreConn->LastError.c_str());
+    }
+}
+
+// =============================================================================
+// Print stats and exit
+// =============================================================================
+static void PrintStats()
+{
+    ElleSQLScope coreConn(ElleDB::CORE);
+    if (!coreConn.Valid())
+    {
+        wprintf(L"[ERROR] Cannot connect to ElleCore\n");
+        return;
+    }
+
+    wprintf(L"\n=== Queue Statistics ===\n\n");
+
+    wprintf(L"IntentQueue:\n");
+    coreConn->Query(
+        L"SELECT StatusID, COUNT(*), MAX(Priority), MIN(CreatedAt), MAX(CreatedAt) "
+        L"FROM ElleCore.dbo.IntentQueue GROUP BY StatusID ORDER BY StatusID",
+        [](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 5) return;
+            int statusID = _wtoi(row[0].c_str());
+            wprintf(L"  %-12s  Count=%s  MaxPri=%s  First=%s  Last=%s\n",
+                IntentStatusName(statusID),
+                row[1].c_str(), row[2].c_str(), row[3].c_str(), row[4].c_str());
+        }
+    );
+
+    wprintf(L"\nActionQueue:\n");
+    coreConn->Query(
+        L"SELECT StatusID, COUNT(*) FROM ElleCore.dbo.ActionQueue GROUP BY StatusID ORDER BY StatusID",
+        [](const std::vector<std::wstring>& row)
+        {
+            if (row.size() < 2) return;
+            int statusID = _wtoi(row[0].c_str());
+            wprintf(L"  %-12s  Count=%s\n", ActionStatusName(statusID), row[1].c_str());
+        }
+    );
+
+    int trustScore = 0;
+    coreConn->Query(L"SELECT TOP 1 TrustScore FROM ElleCore.dbo.TrustState ORDER BY UpdatedAt DESC",
+        [&](const std::vector<std::wstring>& row) { if (!row.empty()) trustScore = _wtoi(row[0].c_str()); });
+
+    wprintf(L"\nTrust Score: %d\n", trustScore);
+}
+
+// =============================================================================
+// main
+// =============================================================================
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleConfigReader::Get().Load();
+
+    // Minimal logger — console only for the inspector
+    ElleLogger::Get().Init(L"QueueInspector",
+        ElleConfig::Log::TARGET_CONSOLE | ElleConfig::Log::TARGET_DEBUGGER,
+        ElleLogLevel::WARN,  // Only show warnings in the console — we handle output ourselves
+        L""
+    );
+
+    ElleSQLPool::Get().Init(ElleConfigReader::Get().Server());
+
+    if (argc >= 2)
+    {
+        std::wstring cmd = argv[1];
+
+        if (_wcsicmp(cmd.c_str(), L"inject") == 0)
+        {
+            if (argc < 3)
+            {
+                wprintf(L"Usage: QueueInspector.exe inject <TYPE> [json_data]\n");
+                return 1;
+            }
+            std::wstring typeName = argv[2];
+            std::wstring data     = (argc >= 4) ? argv[3] : L"";
+            InjectIntent(typeName, data);
+            return 0;
+        }
+        else if (_wcsicmp(cmd.c_str(), L"clear") == 0)
+        {
+            if (argc < 3)
+            {
+                wprintf(L"Usage: QueueInspector.exe clear [intents|actions]\n");
+                return 1;
+            }
+            std::wstring target = argv[2];
+            ElleSQLScope coreConn(ElleDB::CORE);
+            if (!coreConn.Valid()) { wprintf(L"[ERROR] DB unavailable\n"); return 1; }
+
+            if (_wcsicmp(target.c_str(), L"intents") == 0)
+            {
+                coreConn->Execute(L"DELETE FROM ElleCore.dbo.IntentQueue");
+                wprintf(L"[OK] IntentQueue cleared\n");
+            }
+            else if (_wcsicmp(target.c_str(), L"actions") == 0)
+            {
+                coreConn->Execute(L"DELETE FROM ElleCore.dbo.ActionQueue");
+                wprintf(L"[OK] ActionQueue cleared\n");
+            }
+            return 0;
+        }
+        else if (_wcsicmp(cmd.c_str(), L"stats") == 0)
+        {
+            PrintStats();
+            return 0;
+        }
+    }
+
+    // Live view mode
+    SetConsoleCtrlHandler([](DWORD) -> BOOL { return TRUE; }, TRUE);
+
+    HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    SetConsoleCtrlHandler([](DWORD type) -> BOOL
+    {
+        if (type == CTRL_C_EVENT) { wprintf(L"\n[QueueInspector] Exiting\n"); return TRUE; }
+        return FALSE;
+    }, TRUE);
+
+    wprintf(L"Queue Inspector running. Ctrl+C to exit.\n");
+
+    while (WaitForSingleObject(stopEvent, 1000) == WAIT_TIMEOUT)
+        PrintQueues();
+
+    ElleSQLPool::Get().Shutdown();
+    ElleLogger::Get().Shutdown();
+    CloseHandle(stopEvent);
+    return 0;
+}

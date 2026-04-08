@@ -1,0 +1,182 @@
+﻿#pragma once
+// =============================================================================
+// ElleLogger.h — Detailed Logging for the Elle-Ann ESI Platform
+//
+// Every log entry captures: timestamp (ms precision), thread ID, service name,
+// source file, source line, function name, log level, and message.
+//
+// Output targets are configurable per-logger instance:
+//   - File:     Rotated log files under ElleConfig::Log::LOG_DIR
+//   - SQL:      ElleSystem.Logs table for cross-service log aggregation
+//   - Debugger: OutputDebugStringW (visible in VS Output / DebugView)
+//   - Console:  stdout/stderr (only when running outside SCM)
+//
+// Usage:
+//   ELLE_LOG_INFO(L"QueueWorker", L"Dequeued intent %lld", intentId);
+//   ELLE_LOG_ERROR(L"HTTPServer", L"Bind failed on port %d: %lu", port, GetLastError());
+//   ELLE_LOG_TRACE(L"EmotionalEngine", L"Decaying dimension %d: %.4f -> %.4f", id, before, after);
+// =============================================================================
+
+#include "ElleTypes.h"
+#include "ElleConfig.h"
+#include <Windows.h>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <mutex>
+#include <vector>
+#include <atomic>
+
+// =============================================================================
+// ELLE_LOG macros — use these everywhere, never call ElleLogger directly
+// They capture __FILE__, __LINE__, __FUNCTION__ automatically
+// =============================================================================
+// Use narrow __FILE__ / __FUNCTION__ and convert inside the logger to avoid
+// relying on compiler-specific wide predefined macros.
+// Variadic macros: pass fmt plus optional args as a variable argument list.
+// This avoids MSVC's handling of empty __VA_ARGS__ by ensuring the entire
+// format + args are provided as a single macro parameter pack.
+#define ELLE_LOG_TRACE(svc, ...)  ElleLogger::Get().Write(ElleLogLevel::TRACE, (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define ELLE_LOG_DEBUG(svc, ...)  ElleLogger::Get().Write(ElleLogLevel::DEBUG, (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define ELLE_LOG_INFO(svc,  ...)  ElleLogger::Get().Write(ElleLogLevel::INFO,  (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define ELLE_LOG_WARN(svc,  ...)  ElleLogger::Get().Write(ElleLogLevel::WARN,  (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define ELLE_LOG_ERROR(svc, ...)  ElleLogger::Get().Write(ElleLogLevel::ERROR, (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define ELLE_LOG_FATAL(svc, ...)  ElleLogger::Get().Write(ElleLogLevel::FATAL, (svc), __FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+
+// Log a Windows HRESULT or GetLastError() value with context
+#define ELLE_LOG_WIN32(svc, msg, code) ElleLogger::Get().WriteWin32Error(ElleLogLevel::ERROR, (svc), __FILE__, __LINE__, __FUNCTION__, (msg), (code))
+
+// Log entry and exit of a scope — use at function entry for TRACE-level call tracking
+#define ELLE_LOG_ENTER(svc) ElleLogger::Get().Write(ElleLogLevel::TRACE, (svc), __FILE__, __LINE__, __FUNCTION__, L"ENTER")
+#define ELLE_LOG_EXIT(svc)  ElleLogger::Get().Write(ElleLogLevel::TRACE, (svc), __FILE__, __LINE__, __FUNCTION__, L"EXIT")
+
+// =============================================================================
+// ElleLogEntry — one complete log record
+// =============================================================================
+struct ElleLogEntry
+{
+    SYSTEMTIME      Timestamp;      // Local time with millisecond precision
+    DWORD           ThreadID;
+    ElleLogLevel    Level;
+    std::wstring    ServiceName;
+    std::wstring    SourceFile;     // Shortened to filename only, not full path
+    int             SourceLine;
+    std::wstring    FunctionName;
+    std::wstring    Message;
+};
+
+// =============================================================================
+// ElleLogger — singleton, thread-safe, multi-target logger
+// =============================================================================
+class ElleLogger
+{
+    ELLE_NONCOPYABLE(ElleLogger)
+
+public:
+    // Singleton access
+    static ElleLogger& Get();
+
+    // Initialize before any logging. Must be called once at service startup.
+    // serviceName:  The owning service name (used as log file name prefix)
+    // targets:      Bitmask of ElleConfig::Log::TARGET_* values
+    // minLevel:     Minimum level to actually write (TRACE writes everything)
+    // sqlConnStr:   ODBC connection string for SQL target (empty = no SQL logging)
+    ElleResult Init(
+        const std::wstring& serviceName,
+        DWORD               targets     = ElleConfig::Log::DEFAULT_TARGETS,
+        ElleLogLevel        minLevel    = static_cast<ElleLogLevel>(ElleConfig::Log::DEFAULT_LEVEL),
+        const std::wstring& sqlConnStr  = L""
+    );
+
+    // Shutdown — flush all buffered entries, close file handles, disconnect SQL
+    void Shutdown();
+
+    // Primary write function — called by macros, not directly
+    // sourceFile and functionName are passed as narrow (const char*) from
+    // macros; the implementation will convert to wide strings for storage.
+    void Write(
+        ElleLogLevel        level,
+        const wchar_t*      serviceName,
+        const char*         sourceFile,
+        int                 sourceLine,
+        const char*         functionName,
+        const wchar_t*      fmt,
+        ...
+    );
+
+    // Win32 error variant — formats the DWORD error code into a human-readable message
+    void WriteWin32Error(
+        ElleLogLevel        level,
+        const wchar_t*      serviceName,
+        const char*         sourceFile,
+        int                 sourceLine,
+        const char*         functionName,
+        const wchar_t*      context,
+        DWORD               win32Error
+    );
+
+    // Change minimum level at runtime (hot config)
+    void SetMinLevel(ElleLogLevel level);
+
+    // Change output targets at runtime
+    void SetTargets(DWORD targets);
+
+    // Force flush all buffered log entries to their targets immediately
+    void Flush();
+
+    // Returns count of entries written since Init()
+    uint64_t EntryCount() const;
+
+    // Returns count of entries dropped due to write failure (target unavailable)
+    uint64_t DroppedCount() const;
+
+private:
+    ElleLogger();
+    ~ElleLogger();
+
+    // Internal write after formatting is complete
+    void WriteEntry(const ElleLogEntry& entry);
+
+    // Format an entry into a single line for file/console/debugger output
+    // Format: [YYYY-MM-DD HH:MM:SS.mmm] [TID:XXXXX] [LEVEL] [Service] [File:Line] Function — Message
+    std::wstring FormatEntry(const ElleLogEntry& entry) const;
+
+    // Write to file target — handles rotation automatically
+    void WriteToFile(const std::wstring& line);
+
+    // Write to SQL target — inserts into ElleSystem.Logs
+    void WriteToSQL(const ElleLogEntry& entry);
+
+    // Write to debugger output (OutputDebugStringW)
+    void WriteToDebugger(const std::wstring& line);
+
+    // Write to console (stdout for INFO and below, stderr for WARN and above)
+    void WriteToConsole(const ElleLogEntry& entry, const std::wstring& line);
+
+    // Open or rotate the log file
+    ElleResult OpenLogFile();
+
+    // Return just the filename from a full path (strips directory prefix)
+    std::wstring ShortFileName(const std::wstring& fullPath) const;
+
+    // Convert ElleLogLevel to its string label
+    const wchar_t* LevelStr(ElleLogLevel level) const;
+
+    // Members
+    std::mutex          m_WriteMutex;
+    std::wstring        m_ServiceName;
+    DWORD               m_Targets;
+    ElleLogLevel        m_MinLevel;
+    std::wstring        m_SqlConnStr;
+    std::wofstream      m_LogFile;
+    std::wstring        m_LogFilePath;
+    SIZE_T              m_LogFileBytesWritten;
+    int                 m_RotationIndex;
+    bool                m_Initialized;
+    std::atomic<uint64_t> m_EntryCount;
+    std::atomic<uint64_t> m_DroppedCount;
+
+    // SQL connection handle for log target (raw ODBC)
+    void*               m_SqlHDBC;      // SQLHDBC — void* to avoid ODBC headers in this header
+    void*               m_SqlHENV;      // SQLHENV
+};

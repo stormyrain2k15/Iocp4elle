@@ -1,0 +1,127 @@
+﻿#pragma once
+// =============================================================================
+// ElleServiceBase.h — Windows Service Scaffold for Elle-Ann Services
+//
+// All C++ services inherit from ElleServiceBase. It handles:
+//   - SCM registration and dispatch
+//   - Service control handler (START, STOP, PAUSE, CONTINUE, INTERROGATE)
+//   - Status reporting to SCM
+//   - Service install/uninstall from command line
+//   - Logger initialization
+//   - SQL pool initialization
+//   - Graceful shutdown sequencing
+//
+// To implement a service:
+//   1. Inherit from ElleServiceBase
+//   2. Override OnStart() — called when SCM starts the service
+//   3. Override OnStop()  — called when SCM stops the service
+//   4. Override OnPause() / OnContinue() if needed
+//   5. In main(), call MyService::RunAsService() or MyService::RunAsConsole()
+//
+// Command line conventions (all services support these):
+//   service.exe install    — installs as Windows Service (auto-start)
+//   service.exe uninstall  — removes the service
+//   service.exe console    — runs in console mode for debugging
+//   (no args)              — normal service startup via SCM
+// =============================================================================
+
+#include "ElleTypes.h"
+#include "ElleConfig.h"
+#include "ElleLogger.h"
+#include "ElleSQLConn.h"
+#include "ElleEpoch.h"
+#include "ElleConfigReader.h"
+#include <Windows.h>
+#include <string>
+
+class ElleServiceBase
+{
+    ELLE_NONCOPYABLE(ElleServiceBase)
+
+public:
+    // serviceName must match ElleConfig::ServiceNames::* exactly
+    explicit ElleServiceBase(const std::wstring& serviceName);
+    virtual ~ElleServiceBase();
+
+    // Entry point called from main() to start the service dispatch loop.
+    // Blocks until the service is stopped by SCM.
+    void RunAsService();
+
+    // Returns true when process is running in an interactive desktop session
+    // (used to distinguish double-click/manual launch from SCM-started services).
+    static bool IsInteractiveSession();
+
+    // Entry point for console/debug mode. Calls OnStart(), waits for Ctrl+C, calls OnStop().
+    void RunAsConsole();
+
+    // Install this service with the Windows SCM (auto-start, LocalSystem)
+    ElleResult Install(
+        const std::wstring& displayName,
+        const std::wstring& description,
+        const std::wstring& exePath
+    );
+
+    // Remove this service from the Windows SCM
+    ElleResult Uninstall();
+
+    const std::wstring& ServiceName() const { return m_ServiceName; }
+    ElleServiceState    CurrentState() const { return m_State; }
+
+    // Update the heartbeat timestamp for this service.
+    // Called by the Heartbeat service engine; other services do not need to call this directly.
+    void TouchHeartbeat();
+
+protected:
+    // Override these in derived services
+    virtual ElleResult  OnStart()   = 0;    // Called when SCM starts the service
+    virtual void        OnStop()    = 0;    // Called when SCM stops the service
+    virtual void        OnPause()   {}      // Optional
+    virtual void        OnContinue(){}      // Optional
+
+    // Report current state to SCM (call this from OnStart if startup takes time)
+    void ReportStartPending(DWORD checkpointMs = 3000);
+    void ReportStopPending(DWORD checkpointMs  = 3000);
+    void ReportRunning();
+    void ReportPaused();
+    void ReportStopped(DWORD exitCode = NO_ERROR);
+
+    // Convenience: initialize logger and SQL pool.
+    // Call from OnStart() before doing anything else.
+    ElleResult InitSharedInfrastructure();
+
+    // Shutdown logger and SQL pool.
+    // Call at the end of OnStop().
+    void ShutdownSharedInfrastructure();
+
+    // Register this service as running in ElleSystem.Workers, stamping
+    // the current epoch. Call once per OnStart() after InitSharedInfrastructure().
+    // All the per-service inline UPSERT blocks are replaced by this call.
+    ElleResult RegisterWorker();
+
+    // Mark this service as stopped in ElleSystem.Workers.
+    // Call at the start of OnStop() before shutting down infrastructure.
+    void UnregisterWorker();
+
+    // The stop event
+    // main loop to know when to exit cleanly
+    HANDLE StopEvent() const { return m_StopEvent; }
+
+    std::wstring        m_ServiceName;
+
+private:
+    // SCM dispatch and control handler (static because SCM calls these as C functions)
+    static void WINAPI  ServiceMain(DWORD argc, LPWSTR* argv);
+    static DWORD WINAPI ServiceCtrlHandlerEx(DWORD control, DWORD eventType,
+                                              LPVOID eventData, LPVOID context);
+
+    void                SetStatus(DWORD state, DWORD waitHint = 0, DWORD exitCode = NO_ERROR);
+
+    SERVICE_STATUS              m_Status;
+    SERVICE_STATUS_HANDLE       m_StatusHandle;
+    ElleServiceState            m_State;
+    HANDLE                      m_StopEvent;
+
+    // Static pointer to the current service instance for SCM callbacks
+    // Only one service instance runs per process
+    static ElleServiceBase*     s_Instance;
+};

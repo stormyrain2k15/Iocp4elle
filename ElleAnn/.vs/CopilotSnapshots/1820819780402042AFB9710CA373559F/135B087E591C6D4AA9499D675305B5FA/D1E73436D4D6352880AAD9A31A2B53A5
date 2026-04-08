@@ -1,0 +1,1037 @@
+﻿// =============================================================================
+// ElleSQLConn.cpp — Implementation
+// =============================================================================
+
+#include "ElleSQLConn.h"
+#include "ElleConfigReader.h"
+#include <sqlext.h>
+#include <sql.h>
+#include <sstream>
+
+static const wchar_t* s_DBNames[static_cast<int>(ElleDB::COUNT)] =
+{
+    ElleConfig::DB::DB_CORE,
+    ElleConfig::DB::DB_MEMORY,
+    ElleConfig::DB::DB_KNOWLEDGE,
+    ElleConfig::DB::DB_SYSTEM,
+    ElleConfig::DB::DB_HEART
+};
+
+// =============================================================================
+// ElleSQLConnection
+// =============================================================================
+ElleSQLConnection::ElleSQLConnection(ElleDB db, const std::wstring& connStr)
+    : Database(db)
+    , m_ConnStr(connStr)
+    , m_hEnv(nullptr)
+    , m_hDBC(nullptr)
+    , m_Connected(false)
+{
+}
+
+ElleSQLConnection::~ElleSQLConnection()
+{
+    Disconnect();
+}
+
+ElleResult ElleSQLConnection::Connect()
+{
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Connecting to DB[%d]", static_cast<int>(Database));
+                ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    SQLRETURN ret;
+
+    ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &m_hEnv);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        LastError = L"SQLAllocHandle(ENV) failed";
+        {
+            wchar_t _elle_log_buf[512] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"%s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+        }
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    SQLSetEnvAttr(m_hEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+
+    ret = SQLAllocHandle(SQL_HANDLE_DBC, m_hEnv, &m_hDBC);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_ENV, m_hEnv);
+        SQLFreeHandle(SQL_HANDLE_ENV, m_hEnv);
+        m_hEnv = nullptr;
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"SQLAllocHandle(DBC) failed: %s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    // Set connection timeout
+    SQLUINTEGER timeout = ElleConfig::DB::CONNECTION_TIMEOUT_SEC;
+    SQLSetConnectAttr(m_hDBC, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)(UINT_PTR)timeout, 0);
+    SQLSetConnectAttr(m_hDBC, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)(UINT_PTR)timeout, 0);
+
+    SQLWCHAR outConnStr[1024] = {};
+    SQLSMALLINT outLen = 0;
+
+    ret = SQLDriverConnectW(
+        m_hDBC,
+        nullptr,
+        (SQLWCHAR*)m_ConnStr.c_str(),
+        (SQLSMALLINT)m_ConnStr.length(),
+        outConnStr,
+        1024,
+        &outLen,
+        SQL_DRIVER_NOPROMPT
+    );
+
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_DBC, m_hDBC);
+        SQLFreeHandle(SQL_HANDLE_DBC, m_hDBC);
+        SQLFreeHandle(SQL_HANDLE_ENV, m_hEnv);
+        m_hDBC = nullptr;
+        m_hEnv = nullptr;
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"SQLDriverConnect failed for DB[%d]: %s",
+                static_cast<int>(Database), LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+        }
+        return ElleResult::ERR_SQL_CONNECT;
+    }
+
+    m_Connected = true;
+    {
+        wchar_t _elle_log_buf[1024] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE,
+            L"Connected to DB[%d] (%s)", static_cast<int>(Database), s_DBNames[static_cast<int>(Database)]);
+        ElleLogger::Get().Write(ElleLogLevel::DEBUG, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+    return ElleResult::OK;
+}
+
+void ElleSQLConnection::Disconnect()
+{
+    if (m_hDBC)
+    {
+        SQLDisconnect(m_hDBC);
+        SQLFreeHandle(SQL_HANDLE_DBC, m_hDBC);
+        m_hDBC = nullptr;
+    }
+    if (m_hEnv)
+    {
+        SQLFreeHandle(SQL_HANDLE_ENV, m_hEnv);
+        m_hEnv = nullptr;
+    }
+    m_Connected = false;
+}
+
+bool ElleSQLConnection::IsConnected() const
+{
+    return m_Connected && m_hDBC != nullptr;
+}
+
+bool ElleSQLConnection::Ping()
+{
+    if (!IsConnected())
+        return false;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+    SQLRETURN ret = SQLExecDirectW(hStmt, (SQLWCHAR*)L"SELECT 1", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    return SQL_SUCCEEDED(ret);
+}
+
+ElleResult ElleSQLConnection::Execute(const std::wstring& sql)
+{
+    {
+        wchar_t _elle_log_buf[2048] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Execute: %s", sql.c_str());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+
+    if (!IsConnected())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLExecDirectW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+
+    ElleResult result = ElleResult::OK;
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA)
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        {
+            wchar_t _elle_log_buf[2048] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Execute failed: %s | SQL: %s", LastError.c_str(), sql.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+        result = ElleResult::ERR_SQL_QUERY;
+    }
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    return result;
+}
+
+ElleResult ElleSQLConnection::ExecuteParams(
+    const std::wstring& sql,
+    const std::vector<std::wstring>& params)
+{
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteParams: %s [%zu params]", sql.c_str(), params.size());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+
+    if (!IsConnected())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLPrepareW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"SQLPrepare failed: %s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return ElleResult::ERR_SQL_QUERY;
+    }
+
+    std::vector<SQLLEN> indicators(params.size(), SQL_NTS);
+    for (SQLUSMALLINT i = 0; i < (SQLUSMALLINT)params.size(); i++)
+    {
+        SQLBindParameter(
+            hStmt, (SQLUSMALLINT)(i + 1),
+            SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+            params[i].length(), 0,
+            (SQLPOINTER)params[i].c_str(), 0,
+            &indicators[i]
+        );
+    }
+
+    ret = SQLExecute(hStmt);
+    ElleResult result = ElleResult::OK;
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA)
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteParams failed: %s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+        }
+        result = ElleResult::ERR_SQL_QUERY;
+    }
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    return result;
+}
+
+ElleResult ElleSQLConnection::Query(
+    const std::wstring& sql,
+    std::function<void(const std::vector<std::wstring>&)> rowCallback)
+{
+    {
+        wchar_t _elle_log_buf[2048] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Query: %s", sql.c_str());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+
+    if (!IsConnected())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLExecDirectW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Query exec failed: %s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return ElleResult::ERR_SQL_QUERY;
+    }
+
+    ElleResult result = ExecuteStatement(hStmt, rowCallback);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    return result;
+}
+
+ElleResult ElleSQLConnection::QueryParams(
+    const std::wstring& sql,
+    const std::vector<std::wstring>& params,
+    std::function<void(const std::vector<std::wstring>&)> rowCallback)
+{
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"QueryParams: %s [%zu params]", sql.c_str(), params.size());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    if (!IsConnected())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLPrepareW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return ElleResult::ERR_SQL_QUERY;
+    }
+
+    std::vector<SQLLEN> indicators(params.size(), SQL_NTS);
+    for (SQLUSMALLINT i = 0; i < (SQLUSMALLINT)params.size(); i++)
+    {
+        SQLBindParameter(
+            hStmt, (SQLUSMALLINT)(i + 1),
+            SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+            params[i].length(), 0,
+            (SQLPOINTER)params[i].c_str(), 0,
+            &indicators[i]
+        );
+    }
+
+    ret = SQLExecute(hStmt);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return ElleResult::ERR_SQL_QUERY;
+    }
+
+    ElleResult result = ExecuteStatement(hStmt, rowCallback);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+    return result;
+}
+
+ElleResult ElleSQLConnection::ExecProc(
+    const std::wstring& procName,
+    const std::vector<std::pair<std::wstring, std::wstring>>& params)
+{
+    // Build: { CALL procName(?, ?, ...) }
+    std::wstring sql = L"{ CALL " + procName + L"(";
+    for (size_t i = 0; i < params.size(); i++)
+    {
+        sql += (i == 0) ? L"?" : L", ?";
+    }
+    sql += L") }";
+
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecProc: %s [%zu params]", sql.c_str(), params.size());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    std::vector<std::wstring> values;
+    values.reserve(params.size());
+    for (auto& p : params)
+        values.push_back(p.second);
+
+    return ExecuteParams(sql, values);
+}
+
+ElleResult ElleSQLConnection::ExecuteStatement(
+    SQLHSTMT hStmt,
+    std::function<void(const std::vector<std::wstring>&)> rowCallback,
+    int* outRowCount)
+{
+    SQLSMALLINT colCount = 0;
+    SQLNumResultCols(hStmt, &colCount);
+
+    if (outRowCount) *outRowCount = 0;
+
+    if (colCount == 0)
+        return ElleResult::OK;  // DML or no result set — not an error
+
+    int rowCount = 0;
+    SQLRETURN fetchRet;
+
+    // SQL_SUCCESS_WITH_INFO is a valid success return from SQLFetch.
+    // Stopping only on SQL_SUCCESS silently drops rows when ODBC returns
+    // an informational state (e.g. string truncation warning 01004).
+    while (SQL_SUCCEEDED(fetchRet = SQLFetch(hStmt)))
+    {
+        std::vector<std::wstring> row;
+        row.reserve(colCount);
+
+        for (SQLUSMALLINT col = 1; col <= (SQLUSMALLINT)colCount; col++)
+        {
+            wchar_t buf[4096] = {};
+            SQLLEN indicator = 0;
+            SQLRETURN ret = SQLGetData(hStmt, col, SQL_C_WCHAR, buf, sizeof(buf), &indicator);
+
+            if (SQL_SUCCEEDED(ret) && indicator != SQL_NULL_DATA)
+                row.emplace_back(buf);
+            else
+                row.emplace_back(L"");
+        }
+
+        if (rowCallback)
+            rowCallback(row);
+
+        rowCount++;
+    }
+
+    if (outRowCount) *outRowCount = rowCount;
+
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Query returned %d rows (last fetch ret=%d)", rowCount, (int)fetchRet);
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    // Zero rows is a valid outcome at the connection layer.
+    // Callers that need to distinguish empty vs non-empty results should
+    // inspect outRowCount. ERR_SQL_NO_DATA is only returned by QueryRows().
+    return ElleResult::OK;
+}
+
+void ElleSQLConnection::CaptureError(SQLSMALLINT handleType, SQLHANDLE handle)
+{
+    SQLWCHAR state[8] = {};
+    SQLWCHAR msg[512] = {};
+    SQLINTEGER nativeErr = 0;
+    SQLSMALLINT msgLen = 0;
+
+    LastError.clear();
+
+    SQLSMALLINT recNum = 1;
+    while (SQLGetDiagRecW(handleType, handle, recNum++, state, &nativeErr, msg, 512, &msgLen) == SQL_SUCCESS)
+    {
+        if (!LastError.empty())
+            LastError += L" | ";
+        LastError += L"[";
+        LastError += state;
+        LastError += L"] ";
+        LastError += msg;
+    }
+}
+
+// =============================================================================
+// ElleSQLScope
+// =============================================================================
+ElleSQLScope::ElleSQLScope(ElleDB db)
+    : m_DB(db)
+    , m_Conn(nullptr)
+{
+    m_Conn = ElleSQLPool::Get().Checkout(db);
+}
+
+ElleSQLScope::~ElleSQLScope()
+{
+    if (m_Conn)
+        ElleSQLPool::Get().Return(m_Conn);
+}
+
+// =============================================================================
+// ElleSQLPool
+// =============================================================================
+ElleSQLPool& ElleSQLPool::Get()
+{
+    static ElleSQLPool instance;
+    return instance;
+}
+
+ElleSQLPool::ElleSQLPool()
+    : m_Initialized(false)
+{
+}
+
+ElleSQLPool::~ElleSQLPool()
+{
+    Shutdown();
+}
+
+ElleResult ElleSQLPool::Init(const std::wstring& serverInstance)
+{
+    m_Server = serverInstance;
+
+    ELLE_LOG_INFO(L"ElleSQLPool", L"Initializing connection pool. Server=[%s] MinConn=%d MaxConn=%d",
+        serverInstance.c_str(), ElleConfig::DB::POOL_MIN_CONNECTIONS, ElleConfig::DB::POOL_MAX_CONNECTIONS);
+
+    for (int db = 0; db < static_cast<int>(ElleDB::COUNT); db++)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex[db]);
+        std::wstring connStr = BuildConnStr(static_cast<ElleDB>(db), serverInstance);
+
+        // Pre-establish minimum connections
+        for (int i = 0; i < ElleConfig::DB::POOL_MIN_CONNECTIONS; i++)
+        {
+            auto* conn = new ElleSQLConnection(static_cast<ElleDB>(db), connStr);
+
+            int retries = 0;
+            ElleResult r = ElleResult::ERR_SQL_CONNECT;
+            while (retries < ElleConfig::DB::RETRY_COUNT && r != ElleResult::OK)
+            {
+                r = conn->Connect();
+                if (r != ElleResult::OK)
+                {
+                    ELLE_LOG_WARN(L"ElleSQLPool", L"DB[%d] connect attempt %d/%d failed",
+                        db, retries + 1, ElleConfig::DB::RETRY_COUNT);
+                    Sleep(ElleConfig::DB::RETRY_DELAY_MS);
+                }
+                retries++;
+            }
+
+            if (r != ElleResult::OK)
+            {
+                ELLE_LOG_ERROR(L"ElleSQLPool", L"Failed to establish initial connection for DB[%d] after %d retries",
+                    db, ElleConfig::DB::RETRY_COUNT);
+                delete conn;
+                // Continue — the pool will attempt reconnect on first Checkout
+            }
+            else
+            {
+                m_Pools[db].push_back({ conn, false });
+                ELLE_LOG_DEBUG(L"ElleSQLPool", L"DB[%d] slot %d ready", db, i);
+            }
+        }
+    }
+
+    m_Initialized = true;
+    ELLE_LOG_INFO(L"ElleSQLPool", L"Connection pool initialized");
+    return ElleResult::OK;
+}
+
+void ElleSQLPool::Shutdown()
+{
+    if (!m_Initialized)
+        return;
+
+    ELLE_LOG_INFO(L"ElleSQLPool", L"Shutting down connection pool");
+
+    for (int db = 0; db < static_cast<int>(ElleDB::COUNT); db++)
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex[db]);
+        for (auto& slot : m_Pools[db])
+        {
+            if (slot.Conn)
+            {
+                slot.Conn->Disconnect();
+                delete slot.Conn;
+                slot.Conn = nullptr;
+            }
+        }
+        m_Pools[db].clear();
+    }
+
+    m_Initialized = false;
+}
+
+ElleSQLConnection* ElleSQLPool::Checkout(ElleDB db)
+{
+    int dbIdx = static_cast<int>(db);
+    std::lock_guard<std::mutex> lock(m_Mutex[dbIdx]);
+
+    std::wstring connStr = BuildConnStr(db, m_Server);
+
+    // Find an idle connection
+    for (auto& slot : m_Pools[dbIdx])
+    {
+        if (!slot.InUse)
+        {
+            // Verify it's still alive
+            if (!slot.Conn->Ping())
+            {
+                ELLE_LOG_WARN(L"ElleSQLPool", L"DB[%d] connection went stale — reconnecting", dbIdx);
+                slot.Conn->Disconnect();
+                ElleResult r = slot.Conn->Connect();
+                if (r != ElleResult::OK)
+                {
+                    ELLE_LOG_ERROR(L"ElleSQLPool", L"DB[%d] reconnect failed", dbIdx);
+                    continue;
+                }
+            }
+
+            slot.InUse = true;
+            ELLE_LOG_TRACE(L"ElleSQLPool", L"DB[%d] connection checked out", dbIdx);
+            return slot.Conn;
+        }
+    }
+
+    // No idle connection found — try to expand pool
+    if ((int)m_Pools[dbIdx].size() < ElleConfig::DB::POOL_MAX_CONNECTIONS)
+    {
+        auto* conn = new ElleSQLConnection(db, connStr);
+        ElleResult r = conn->Connect();
+        if (r == ElleResult::OK)
+        {
+            m_Pools[dbIdx].push_back({ conn, true });
+            {
+                wchar_t _elle_log_buf[512] = {};
+                _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"DB[%d] pool expanded to %zu connections",
+                    dbIdx, m_Pools[dbIdx].size());
+                ElleLogger::Get().Write(ElleLogLevel::INFO, L"ElleSQLPool", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+            }
+            return conn;
+        }
+        else
+        {
+            {
+                wchar_t _elle_log_buf[1024] = {};
+                _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"DB[%d] pool expansion connect failed: %s",
+                    dbIdx, conn->LastError.c_str());
+                ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLPool", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+            }
+            delete conn;
+        }
+    }
+    else
+    {
+        {
+            wchar_t _elle_log_buf[256] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"DB[%d] pool exhausted (max=%d). No connections available.",
+                dbIdx, ElleConfig::DB::POOL_MAX_CONNECTIONS);
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLPool", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+    }
+
+    return nullptr;
+}
+
+void ElleSQLPool::Return(ElleSQLConnection* conn)
+{
+    if (!conn)
+        return;
+
+    int dbIdx = static_cast<int>(conn->Database);
+    std::lock_guard<std::mutex> lock(m_Mutex[dbIdx]);
+
+    for (auto& slot : m_Pools[dbIdx])
+    {
+        if (slot.Conn == conn)
+        {
+            slot.InUse = false;
+            {
+                wchar_t _elle_log_buf[256] = {};
+                _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"DB[%d] connection returned to pool", dbIdx);
+                ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLPool", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+            }
+            return;
+        }
+    }
+
+    // Connection not found in pool — it was dynamically allocated during expansion
+    // and something went wrong tracking it. Disconnect and free.
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"Return called for untracked connection on DB[%d]. Freeing.", dbIdx);
+        ElleLogger::Get().Write(ElleLogLevel::WARN, L"ElleSQLPool", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+    conn->Disconnect();
+    delete conn;
+}
+
+int ElleSQLPool::ActiveCount(ElleDB db) const
+{
+    int dbIdx = static_cast<int>(db);
+    std::lock_guard<std::mutex> lock(m_Mutex[dbIdx]);
+    int count = 0;
+    for (auto& slot : m_Pools[dbIdx])
+        if (slot.InUse) count++;
+    return count;
+}
+
+int ElleSQLPool::IdleCount(ElleDB db) const
+{
+    int dbIdx = static_cast<int>(db);
+    std::lock_guard<std::mutex> lock(m_Mutex[dbIdx]);
+    int count = 0;
+    for (auto& slot : m_Pools[dbIdx])
+        if (!slot.InUse) count++;
+    return count;
+}
+
+std::wstring ElleSQLPool::BuildConnStr(ElleDB db, const std::wstring& server) const
+{
+    wchar_t buf[1024] = {};
+    const wchar_t* dbName = s_DBNames[static_cast<int>(db)];
+
+    // Read auth settings from the runtime config file, not compile-time constants.
+    // ElleConfigReader is loaded by InitSharedInfrastructure before Init() is called.
+    // Set DB_AUTH=sql, DB_UID=..., DB_PWD=... in C:\Elle\ElleAnn.config to use SQL auth.
+    std::wstring driver = ElleConfigReader::Get().Value(L"DB_DRIVER", ElleConfig::DB::DRIVER);
+    std::wstring uid    = ElleConfigReader::Get().Value(L"DB_UID",    L"");
+    std::wstring pwd    = ElleConfigReader::Get().Value(L"DB_PWD",    L"");
+    std::wstring auth   = ElleConfigReader::Get().Value(L"DB_AUTH",   L"windows");
+
+    if (auth == L"sql" && !uid.empty())
+    {
+        // SQL Server authentication.
+        // TrustServerCertificate=Yes is required when the server uses a self-signed cert
+        // (default for named instances). Matches "Trust Server Certificate" in SSMS.
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+            L"Driver=%s;Server=%s;Database=%s;UID=%s;PWD=%s;"
+            L"Encrypt=yes;TrustServerCertificate=yes;",
+            driver.c_str(), server.c_str(), dbName,
+            uid.c_str(), pwd.c_str()
+        );
+    }
+    else
+    {
+        // Windows authentication — the service account must have SQL Server access.
+        // Grant NT AUTHORITY\SYSTEM in SSMS > Security > Logins if running as LocalSystem.
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+            L"Driver=%s;Server=%s;Database=%s;Trusted_Connection=Yes;",
+            driver.c_str(), server.c_str(), dbName
+        );
+    }
+
+    return std::wstring(buf);
+}
+
+// =============================================================================
+// QueryRows — query that returns ERR_SQL_NO_DATA when zero rows come back.
+// Use this only when you genuinely require at least one row. For polling loops
+// and conditional reads where zero rows is normal, use Query() instead.
+// =============================================================================
+ElleResult ElleSQLConnection::QueryRows(
+    const std::wstring& sql,
+    std::function<void(const std::vector<std::wstring>&)> rowCallback,
+    int& outRowCount)
+{
+    {
+        wchar_t _elle_log_buf[2048] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"QueryRows: %s", sql.c_str());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+
+    if (!IsConnected())
+        return ElleResult::ERR_SQL_CONNECT;
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLExecDirectW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"QueryRows exec failed: %s", LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return ElleResult::ERR_SQL_QUERY;
+    }
+
+    outRowCount = 0;
+    ElleResult result = ExecuteStatement(hStmt, rowCallback, &outRowCount);
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+
+    // This is the one place ERR_SQL_NO_DATA is appropriate: the caller
+    // explicitly asked for a query that requires rows.
+    if (result == ElleResult::OK && outRowCount == 0)
+        return ElleResult::ERR_SQL_NO_DATA;
+
+    return result;
+}
+
+// =============================================================================
+// ExecuteStructured — write with rows-affected captured in the same batch.
+//
+// Wraps the caller's statement in a DECLARE/@affected batch so @@ROWCOUNT
+// is captured before any other statement can reset it. Returns a structured
+// result with RowsAffected populated directly from the server response.
+// No separate SELECT @@ROWCOUNT round-trip. No guessing.
+// =============================================================================
+ElleResult ElleSQLConnection::ExecuteStructured(
+    const std::wstring& sql,
+    const std::vector<std::wstring>& params,
+    ElleSQLResult& outResult)
+{
+    {
+        wchar_t _elle_log_buf[2048] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteStructured: %s", sql.c_str());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+    }
+
+    outResult = ElleSQLResult{};
+    outResult.Status = ElleResult::ERR_GENERIC;
+
+    if (!IsConnected())
+    {
+        outResult.Status = ElleResult::ERR_SQL_CONNECT;
+        return outResult.Status;
+    }
+
+    // Wrap in a batch that captures @@ROWCOUNT and SELECTs it back
+    // so we get rows-affected as a result set, not a side-channel.
+    // Format: DECLARE @r INT; <original_sql>; SET @r = @@ROWCOUNT; SELECT @r;
+    std::wstring batch =
+        L"DECLARE @_affected INT; " +
+        sql +
+        L"; SET @_affected = @@ROWCOUNT; SELECT @_affected AS RowsAffected;";
+
+    // If there are no params the batch runs as a plain statement.
+    // If there are params the placeholders are in the original sql fragment.
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret;
+    if (!params.empty())
+    {
+        ret = SQLPrepareW(hStmt, (SQLWCHAR*)batch.c_str(), SQL_NTS);
+        if (!SQL_SUCCEEDED(ret))
+        {
+            CaptureError(SQL_HANDLE_STMT, hStmt);
+            outResult.Status     = ElleResult::ERR_SQL_QUERY;
+            outResult.ErrorDetail = LastError;
+            {
+                wchar_t _elle_log_buf[1024] = {};
+                _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteStructured prepare failed: %s", LastError.c_str());
+                ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+            }
+            SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+            return outResult.Status;
+        }
+
+        std::vector<SQLLEN> indicators(params.size(), SQL_NTS);
+        for (SQLUSMALLINT i = 0; i < (SQLUSMALLINT)params.size(); i++)
+        {
+            SQLBindParameter(hStmt, (SQLUSMALLINT)(i + 1),
+                SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+                params[i].length(), 0,
+                (SQLPOINTER)params[i].c_str(), 0, &indicators[i]);
+        }
+
+        ret = SQLExecute(hStmt);
+    }
+    else
+    {
+        ret = SQLExecDirectW(hStmt, (SQLWCHAR*)batch.c_str(), SQL_NTS);
+    }
+
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA)
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        outResult.Status      = ElleResult::ERR_SQL_QUERY;
+        outResult.ErrorDetail = LastError;
+            {
+                wchar_t _elle_log_buf[1024] = {};
+                _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteStructured exec failed: %s", LastError.c_str());
+                ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILEW__, __LINE__, __FUNCTIONW__, _elle_log_buf);
+            }
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return outResult.Status;
+    }
+
+    // The batch may produce multiple result sets (the write itself produces none,
+    // then the SELECT @_affected produces one). Advance to the result set.
+    // SQLMoreResults advances past any implicit result sets from the write.
+    SQLRETURN moreRet = SQL_SUCCESS;
+    bool foundResultSet = false;
+
+    do
+    {
+        SQLSMALLINT colCount = 0;
+        SQLNumResultCols(hStmt, &colCount);
+        if (colCount > 0)
+        {
+            foundResultSet = true;
+            break;
+        }
+        moreRet = SQLMoreResults(hStmt);
+    }
+    while (SQL_SUCCEEDED(moreRet));
+
+    if (foundResultSet && SQL_SUCCEEDED(SQLFetch(hStmt)))
+    {
+        wchar_t buf[32] = {};
+        SQLLEN ind = 0;
+        if (SQL_SUCCEEDED(SQLGetData(hStmt, 1, SQL_C_WCHAR, buf, sizeof(buf), &ind)) && ind != SQL_NULL_DATA)
+            outResult.RowsAffected = _wtoi(buf);
+    }
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+
+    outResult.WriteSucceeded = (outResult.RowsAffected > 0);
+    outResult.Status         = ElleResult::OK;
+
+    {
+        wchar_t _elle_log_buf[256] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecuteStructured: RowsAffected=%d", outResult.RowsAffected);
+        ElleLogger::Get().Write(ElleLogLevel::DEBUG, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// ExecProcStructured — call a stored procedure and return structured result.
+//
+// The stored procedure is expected to SELECT its result row(s) as the last
+// result set so callers can verify the persisted state in a single round-trip.
+// The rowCallback receives each row of that result set.
+// RowsAffected is read from a column named "RowsAffected" in the first
+// result set, if present. If the proc does not return that column the
+// RowsAffected field will be 0 (not -1 — absence of information is not failure).
+// =============================================================================
+ElleResult ElleSQLConnection::ExecProcStructured(
+    const std::wstring& procName,
+    const std::vector<std::pair<std::wstring, std::wstring>>& params,
+    ElleSQLResult& outResult,
+    std::function<void(const std::vector<std::wstring>&)> rowCallback)
+{
+    {
+        wchar_t _elle_log_buf[512] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecProcStructured: %s [%zu params]", procName.c_str(), params.size());
+        ElleLogger::Get().Write(ElleLogLevel::TRACE, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    outResult = ElleSQLResult{};
+    outResult.Status = ElleResult::ERR_GENERIC;
+
+    if (!IsConnected())
+    {
+        outResult.Status = ElleResult::ERR_SQL_CONNECT;
+        return outResult.Status;
+    }
+
+    // Build: { CALL procName(?, ?, ...) }
+    std::wstring sql = L"{ CALL " + procName + L"(";
+    for (size_t i = 0; i < params.size(); i++)
+        sql += (i == 0) ? L"?" : L", ?";
+    sql += L") }";
+
+    SQLHSTMT hStmt = nullptr;
+    SQLAllocHandle(SQL_HANDLE_STMT, m_hDBC, &hStmt);
+
+    SQLUINTEGER qTimeout = ElleConfig::DB::QUERY_TIMEOUT_SEC;
+    SQLSetStmtAttr(hStmt, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(UINT_PTR)qTimeout, 0);
+
+    SQLRETURN ret = SQLPrepareW(hStmt, (SQLWCHAR*)sql.c_str(), SQL_NTS);
+    if (!SQL_SUCCEEDED(ret))
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        outResult.Status      = ElleResult::ERR_SQL_QUERY;
+        outResult.ErrorDetail = LastError;
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return outResult.Status;
+    }
+
+    std::vector<SQLLEN> indicators(params.size(), SQL_NTS);
+    for (SQLUSMALLINT i = 0; i < (SQLUSMALLINT)params.size(); i++)
+    {
+        SQLBindParameter(hStmt, (SQLUSMALLINT)(i + 1),
+            SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+            params[i].second.length(), 0,
+            (SQLPOINTER)params[i].second.c_str(), 0, &indicators[i]);
+    }
+
+    ret = SQLExecute(hStmt);
+    if (!SQL_SUCCEEDED(ret) && ret != SQL_NO_DATA)
+    {
+        CaptureError(SQL_HANDLE_STMT, hStmt);
+        outResult.Status      = ElleResult::ERR_SQL_QUERY;
+        outResult.ErrorDetail = LastError;
+        {
+            wchar_t _elle_log_buf[1024] = {};
+            _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecProcStructured failed for %s: %s", procName.c_str(), LastError.c_str());
+            ElleLogger::Get().Write(ElleLogLevel::ERROR, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+        return outResult.Status;
+    }
+
+    // Walk all result sets. The first result set with a "RowsAffected" column
+    // is the affected-count set. Subsequent result sets are data rows.
+    bool affectedRead = false;
+    SQLRETURN moreRet = SQL_SUCCESS;
+
+    do
+    {
+        SQLSMALLINT colCount = 0;
+        SQLNumResultCols(hStmt, &colCount);
+        if (colCount <= 0) { moreRet = SQLMoreResults(hStmt); continue; }
+
+        // Inspect the first column name to decide what this result set contains
+        wchar_t firstColName[128] = {};
+        SQLSMALLINT nameLen = 0;
+        SQLDescribeColW(hStmt, 1, (SQLWCHAR*)firstColName, 128, &nameLen,
+                        nullptr, nullptr, nullptr, nullptr);
+
+        bool isAffectedSet = (_wcsicmp(firstColName, L"RowsAffected") == 0);
+
+        int rowsInSet = 0;
+        while (SQL_SUCCEEDED(SQLFetch(hStmt)))
+        {
+            std::vector<std::wstring> row;
+            row.reserve(colCount);
+            for (SQLUSMALLINT col = 1; col <= (SQLUSMALLINT)colCount; col++)
+            {
+                wchar_t buf[4096] = {};
+                SQLLEN ind = 0;
+                SQLRETURN gr = SQLGetData(hStmt, col, SQL_C_WCHAR, buf, sizeof(buf), &ind);
+                row.emplace_back((SQL_SUCCEEDED(gr) && ind != SQL_NULL_DATA) ? buf : L"");
+            }
+
+            if (isAffectedSet && !affectedRead && !row.empty())
+            {
+                outResult.RowsAffected = _wtoi(row[0].c_str());
+                affectedRead = true;
+            }
+            else if (rowCallback)
+            {
+                rowCallback(row);
+                outResult.RowsFetched++;
+            }
+
+            rowsInSet++;
+        }
+
+        moreRet = SQLMoreResults(hStmt);
+    }
+    while (SQL_SUCCEEDED(moreRet));
+
+    SQLFreeHandle(SQL_HANDLE_STMT, hStmt);
+
+    outResult.WriteSucceeded = affectedRead ? (outResult.RowsAffected > 0) : true;
+    outResult.Status         = ElleResult::OK;
+
+    {
+        wchar_t _elle_log_buf[1024] = {};
+        _snwprintf_s(_elle_log_buf, _countof(_elle_log_buf), _TRUNCATE, L"ExecProcStructured %s: RowsAffected=%d RowsFetched=%d",
+            procName.c_str(), outResult.RowsAffected, outResult.RowsFetched);
+        ElleLogger::Get().Write(ElleLogLevel::DEBUG, L"ElleSQLConn", __FILE__, __LINE__, __FUNCTION__, _elle_log_buf);
+    }
+
+    return ElleResult::OK;
+}

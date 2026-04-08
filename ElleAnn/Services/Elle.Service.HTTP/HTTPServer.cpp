@@ -1,0 +1,616 @@
+// =============================================================================
+// HTTPServer.cpp — Implementation
+// =============================================================================
+
+#include "HTTPServer.h"
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+
+// =============================================================================
+// HttpResponse convenience constructors
+// =============================================================================
+HttpResponse HttpResponse::OK(const std::string& jsonBody)
+{
+    HttpResponse r;
+    r.StatusCode = 200;
+    r.StatusText = L"OK";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = jsonBody;
+    return r;
+}
+
+HttpResponse HttpResponse::BadRequest(const std::string& message)
+{
+    HttpResponse r;
+    r.StatusCode = 400;
+    r.StatusText = L"Bad Request";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = "{\"error\":\"" + message + "\"}";
+    return r;
+}
+
+HttpResponse HttpResponse::NotFound()
+{
+    HttpResponse r;
+    r.StatusCode = 404;
+    r.StatusText = L"Not Found";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = "{\"error\":\"not_found\"}";
+    return r;
+}
+
+HttpResponse HttpResponse::InternalError(const std::string& message)
+{
+    HttpResponse r;
+    r.StatusCode = 500;
+    r.StatusText = L"Internal Server Error";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = "{\"error\":\"" + message + "\"}";
+    return r;
+}
+
+HttpResponse HttpResponse::Unauthorized()
+{
+    HttpResponse r;
+    r.StatusCode = 401;
+    r.StatusText = L"Unauthorized";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = "{\"error\":\"unauthorized\"}";
+    return r;
+}
+
+HttpResponse HttpResponse::MethodNotAllowed()
+{
+    HttpResponse r;
+    r.StatusCode = 405;
+    r.StatusText = L"Method Not Allowed";
+    r.Headers[L"Content-Type"] = L"application/json; charset=utf-8";
+    r.Body = "{\"error\":\"method_not_allowed\"}";
+    return r;
+}
+
+// =============================================================================
+// ElleHTTPServer
+// =============================================================================
+ElleHTTPServer::ElleHTTPServer()
+    : m_ListenSocket(INVALID_SOCKET)
+    , m_IOCP(nullptr)
+    , m_AcceptThread(nullptr)
+    , m_StopEvent(nullptr)
+    , m_Running(false)
+    , m_RequestsHandled(0)
+    , m_ActiveConnections(0)
+{
+}
+
+ElleHTTPServer::~ElleHTTPServer()
+{
+    Stop();
+}
+
+ElleResult ElleHTTPServer::Init()
+{
+    HTTP_LOG(INFO, L"Initializing HTTP server on port %d", ElleConfig::Network::HTTP_PORT);
+
+    WSADATA wsaData;
+    int ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (ret != 0)
+    {
+        HTTP_LOG(FATAL, L"WSAStartup failed: %d", ret);
+        return ElleResult::ERR_NETWORK_BIND;
+    }
+
+    m_ListenSocket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP,
+                                nullptr, 0, WSA_FLAG_OVERLAPPED);
+    if (m_ListenSocket == INVALID_SOCKET)
+    {
+        HTTP_LOG(FATAL, L"WSASocket failed: %d", WSAGetLastError());
+        WSACleanup();
+        return ElleResult::ERR_NETWORK_BIND;
+    }
+
+    // Reuse address so we can restart without waiting for TIME_WAIT
+    BOOL reuseAddr = TRUE;
+    setsockopt(m_ListenSocket, SOL_SOCKET, SO_REUSEADDR,
+               (char*)&reuseAddr, sizeof(reuseAddr));
+
+    // Set send/recv buffer sizes
+    int bufSize = ElleConfig::Network::RECV_BUFFER_SIZE;
+    setsockopt(m_ListenSocket, SOL_SOCKET, SO_RCVBUF, (char*)&bufSize, sizeof(bufSize));
+    setsockopt(m_ListenSocket, SOL_SOCKET, SO_SNDBUF, (char*)&bufSize, sizeof(bufSize));
+
+    // Disable Nagle for latency-sensitive comms
+    BOOL noDelay = TRUE;
+    setsockopt(m_ListenSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&noDelay, sizeof(noDelay));
+
+    sockaddr_in addr = {};
+    addr.sin_family         = AF_INET;
+    addr.sin_addr.s_addr    = INADDR_ANY;
+    addr.sin_port           = htons(ElleConfig::Network::HTTP_PORT);
+
+    if (bind(m_ListenSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        HTTP_LOG(FATAL, L"bind() failed on port %d: %d",
+            ElleConfig::Network::HTTP_PORT, WSAGetLastError());
+        closesocket(m_ListenSocket);
+        m_ListenSocket = INVALID_SOCKET;
+        WSACleanup();
+        return ElleResult::ERR_NETWORK_BIND;
+    }
+
+    if (listen(m_ListenSocket, ElleConfig::Network::LISTEN_BACKLOG) == SOCKET_ERROR)
+    {
+        HTTP_LOG(FATAL, L"listen() failed: %d", WSAGetLastError());
+        closesocket(m_ListenSocket);
+        m_ListenSocket = INVALID_SOCKET;
+        WSACleanup();
+        return ElleResult::ERR_NETWORK_BIND;
+    }
+
+    // Create I/O completion port
+    m_IOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, WORKER_THREAD_COUNT);
+    if (!m_IOCP)
+    {
+        HTTP_LOG(FATAL, L"CreateIoCompletionPort failed: %lu", GetLastError());
+        closesocket(m_ListenSocket);
+        WSACleanup();
+        return ElleResult::ERR_NETWORK_BIND;
+    }
+
+    HTTP_LOG(INFO, L"HTTP server initialized. Listening on 0.0.0.0:%d", ElleConfig::Network::HTTP_PORT);
+    return ElleResult::OK;
+}
+
+ElleResult ElleHTTPServer::Start()
+{
+    m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!m_StopEvent)
+    {
+        HTTP_LOG(FATAL, L"CreateEvent failed: %lu", GetLastError());
+        return ElleResult::ERR_GENERIC;
+    }
+
+    m_Running = true;
+
+    // Start IOCP worker threads
+    for (int i = 0; i < WORKER_THREAD_COUNT; i++)
+    {
+        HANDLE hThread = CreateThread(nullptr, 0, IOCPWorkerProc, this, 0, nullptr);
+        if (!hThread)
+        {
+            HTTP_LOG(ERROR, L"Failed to create IOCP worker thread %d: %lu", i, GetLastError());
+            m_Running = false;
+            return ElleResult::ERR_GENERIC;
+        }
+        m_WorkerThreads.push_back(hThread);
+        HTTP_LOG(DEBUG, L"IOCP worker thread %d started. TID=%lu", i, GetThreadId(hThread));
+    }
+
+    // Start accept thread
+    m_AcceptThread = CreateThread(nullptr, 0, AcceptThreadProc, this, 0, nullptr);
+    if (!m_AcceptThread)
+    {
+        HTTP_LOG(FATAL, L"Failed to create accept thread: %lu", GetLastError());
+        m_Running = false;
+        return ElleResult::ERR_GENERIC;
+    }
+
+    HTTP_LOG(INFO, L"HTTP server running. AcceptTID=%lu WorkerThreads=%d",
+        GetThreadId(m_AcceptThread), WORKER_THREAD_COUNT);
+    return ElleResult::OK;
+}
+
+void ElleHTTPServer::Stop()
+{
+    if (!m_Running)
+        return;
+
+    HTTP_LOG(INFO, L"Stopping HTTP server. RequestsHandled=%llu", m_RequestsHandled.load());
+    m_Running = false;
+
+    if (m_StopEvent)
+        SetEvent(m_StopEvent);
+
+    // Close listen socket to unblock accept()
+    if (m_ListenSocket != INVALID_SOCKET)
+    {
+        closesocket(m_ListenSocket);
+        m_ListenSocket = INVALID_SOCKET;
+    }
+
+    // Wake up IOCP workers with null completions
+    if (m_IOCP)
+    {
+        for (int i = 0; i < WORKER_THREAD_COUNT; i++)
+            PostQueuedCompletionStatus(m_IOCP, 0, 0, nullptr);
+    }
+
+    // Wait for accept thread
+    if (m_AcceptThread)
+    {
+        WaitForSingleObject(m_AcceptThread, 5000);
+        ELLE_SAFE_CLOSE_HANDLE(m_AcceptThread);
+    }
+
+    // Wait for IOCP workers
+    if (!m_WorkerThreads.empty())
+    {
+        WaitForMultipleObjects((DWORD)m_WorkerThreads.size(),
+                               m_WorkerThreads.data(), TRUE, 5000);
+        for (auto h : m_WorkerThreads)
+            CloseHandle(h);
+        m_WorkerThreads.clear();
+    }
+
+    if (m_IOCP)
+    {
+        CloseHandle(m_IOCP);
+        m_IOCP = nullptr;
+    }
+
+    ELLE_SAFE_CLOSE_HANDLE(m_StopEvent);
+    WSACleanup();
+    HTTP_LOG(INFO, L"HTTP server stopped");
+}
+
+void ElleHTTPServer::RegisterRoute(const std::wstring& method, const std::wstring& path, HttpRouteHandler handler)
+{
+    std::lock_guard<std::mutex> lock(m_RouteMutex);
+    m_Routes[{ method, path }] = handler;
+    HTTP_LOG(DEBUG, L"Route registered: %s %s", method.c_str(), path.c_str());
+}
+
+// =============================================================================
+// AcceptThreadProc
+// =============================================================================
+DWORD WINAPI ElleHTTPServer::AcceptThreadProc(LPVOID param)
+{
+    static_cast<ElleHTTPServer*>(param)->AcceptLoop();
+    return 0;
+}
+
+void ElleHTTPServer::AcceptLoop()
+{
+    HTTP_LOG(INFO, L"Accept loop running");
+
+    while (m_Running)
+    {
+        sockaddr_in clientAddr = {};
+        int addrLen = sizeof(clientAddr);
+
+        SOCKET clientSock = accept(m_ListenSocket, (sockaddr*)&clientAddr, &addrLen);
+
+        if (clientSock == INVALID_SOCKET)
+        {
+            if (!m_Running)
+                break;
+            HTTP_LOG(WARN, L"accept() returned INVALID_SOCKET: %d", WSAGetLastError());
+            continue;
+        }
+
+        // Get client IP for logging
+        char ipBuf[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ipBuf, sizeof(ipBuf));
+        HTTP_LOG(DEBUG, L"Accepted connection from %S:%d sock=%llu",
+            ipBuf, ntohs(clientAddr.sin_port), (uint64_t)clientSock);
+
+        m_ActiveConnections.fetch_add(1, std::memory_order_relaxed);
+
+        // Handle this client on a new thread (simple threading model)
+        // For Elle's traffic volume this is fine; IOCP is used for the listen socket
+        struct ClientCtx { ElleHTTPServer* srv; SOCKET sock; };
+        auto* ctx = new ClientCtx{ this, clientSock };
+
+        HANDLE hThread = CreateThread(nullptr, 0,
+            [](LPVOID p) -> DWORD
+            {
+                auto* ctx = static_cast<ClientCtx*>(p);
+                ElleHTTPServer* srv = ctx->srv;
+                SOCKET sock = ctx->sock;
+                delete ctx;
+
+                HttpRequest req = {};
+                req.ClientSocket = sock;
+
+                ElleResult r = srv->ReadRequest(sock, req);
+                if (r == ElleResult::OK)
+                {
+                    HttpResponse resp;
+                    if (req.IsWebSocketUpgrade)
+                    {
+                        // Hand off to WSServer — don't close socket here
+                        // WSServer takes ownership
+                        HTTP_LOG(INFO, L"WebSocket upgrade request from client — handing off");
+                        // Actual handoff happens in RouteDispatch
+                        resp = srv->Dispatch(req);
+                    }
+                    else
+                    {
+                        resp = srv->Dispatch(req);
+                        srv->WriteResponse(sock, resp);
+                        srv->m_RequestsHandled.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                else
+                {
+                    HTTP_LOG(WARN, L"ReadRequest failed for sock=%llu: %s",
+                        (uint64_t)sock, ElleResultStr(r));
+                }
+
+                if (!req.IsWebSocketUpgrade)
+                    closesocket(sock);
+
+                srv->m_ActiveConnections.fetch_add(-1, std::memory_order_relaxed);
+                return 0;
+            },
+            ctx, 0, nullptr);
+
+        if (!hThread)
+        {
+            HTTP_LOG(ERROR, L"CreateThread for client failed: %lu", GetLastError());
+            closesocket(clientSock);
+            delete ctx;
+            m_ActiveConnections.fetch_add(-1, std::memory_order_relaxed);
+        }
+        else
+        {
+            CloseHandle(hThread);  // Detach — thread cleans itself up
+        }
+    }
+
+    HTTP_LOG(INFO, L"Accept loop exiting");
+}
+
+DWORD WINAPI ElleHTTPServer::IOCPWorkerProc(LPVOID param)
+{
+    // Currently used for future IOCP-based large file transfers
+    // For Elle's current traffic, per-client threads are sufficient
+    auto* srv = static_cast<ElleHTTPServer*>(param);
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* pOv = nullptr;
+
+    while (srv->m_Running)
+    {
+        BOOL ok = GetQueuedCompletionStatus(srv->m_IOCP, &bytes, &key, &pOv, INFINITE);
+        if (!ok && pOv == nullptr)
+            break;  // Null completion = shutdown signal
+        if (!srv->m_Running)
+            break;
+    }
+    return 0;
+}
+
+// =============================================================================
+// ReadRequest — reads from socket until full HTTP request received
+// =============================================================================
+ElleResult ElleHTTPServer::ReadRequest(SOCKET sock, HttpRequest& outReq)
+{
+    std::string raw;
+    raw.reserve(4096);
+    char buf[4096];
+
+    // Set receive timeout
+    DWORD timeout = 30000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    while (true)
+    {
+        int received = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (received <= 0)
+        {
+            if (received == 0)
+                HTTP_LOG(DEBUG, L"Client closed connection");
+            else
+                HTTP_LOG(DEBUG, L"recv() error: %d", WSAGetLastError());
+            return ElleResult::ERR_NETWORK_RECV;
+        }
+
+        buf[received] = '\0';
+        raw.append(buf, received);
+
+        // Check if we have the end of headers
+        size_t headerEnd = raw.find("\r\n\r\n");
+        if (headerEnd != std::string::npos)
+        {
+            // Check Content-Length to see if we need to read a body
+            size_t clPos = raw.find("Content-Length:");
+            if (clPos != std::string::npos && clPos < headerEnd)
+            {
+                size_t clEnd = raw.find("\r\n", clPos);
+                std::string clStr = raw.substr(clPos + 15, clEnd - (clPos + 15));
+                // Trim whitespace
+                while (!clStr.empty() && isspace((unsigned char)clStr.front())) clStr.erase(clStr.begin());
+                int contentLength = std::stoi(clStr);
+                size_t bodyStart = headerEnd + 4;
+                int bodyReceived = (int)(raw.size() - bodyStart);
+
+                // Read remaining body bytes
+                while (bodyReceived < contentLength)
+                {
+                    int toRead = std::min(contentLength - bodyReceived, (int)sizeof(buf) - 1);
+                    received = recv(sock, buf, toRead, 0);
+                    if (received <= 0)
+                        return ElleResult::ERR_NETWORK_RECV;
+                    buf[received] = '\0';
+                    raw.append(buf, received);
+                    bodyReceived += received;
+                }
+            }
+            break;
+        }
+
+        // Prevent unbounded read
+        if (raw.size() > 1024 * 1024)
+        {
+            HTTP_LOG(WARN, L"Request exceeded 1MB — rejecting");
+            return ElleResult::ERR_NETWORK_RECV;
+        }
+    }
+
+    return ParseRequest(raw, outReq, sock);
+}
+
+// =============================================================================
+// ParseRequest — parse raw HTTP bytes into HttpRequest struct
+// =============================================================================
+ElleResult ElleHTTPServer::ParseRequest(const std::string& raw, HttpRequest& outReq, SOCKET sock)
+{
+    outReq.ClientSocket = sock;
+
+    // Find request line end
+    size_t lineEnd = raw.find("\r\n");
+    if (lineEnd == std::string::npos)
+        return ElleResult::ERR_INVALID_PARAM;
+
+    std::string requestLine = raw.substr(0, lineEnd);
+
+    // Parse method, path, version
+    size_t sp1 = requestLine.find(' ');
+    size_t sp2 = requestLine.find(' ', sp1 + 1);
+    if (sp1 == std::string::npos || sp2 == std::string::npos)
+        return ElleResult::ERR_INVALID_PARAM;
+
+    std::string method  = requestLine.substr(0, sp1);
+    std::string path    = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+    std::string version = requestLine.substr(sp2 + 1);
+
+    // Convert to wstring for internal use
+    outReq.Method   = std::wstring(method.begin(), method.end());
+    outReq.Version  = std::wstring(version.begin(), version.end());
+
+    // Split path from query string
+    size_t qPos = path.find('?');
+    if (qPos != std::string::npos)
+    {
+        std::string q = path.substr(qPos + 1);
+        path = path.substr(0, qPos);
+        outReq.Query = std::wstring(q.begin(), q.end());
+    }
+    outReq.Path = std::wstring(path.begin(), path.end());
+
+    // Parse headers
+    size_t pos = lineEnd + 2;
+    size_t headerEnd = raw.find("\r\n\r\n");
+    while (pos < headerEnd)
+    {
+        size_t end = raw.find("\r\n", pos);
+        if (end == std::string::npos || end >= headerEnd)
+            break;
+
+        std::string headerLine = raw.substr(pos, end - pos);
+        size_t colon = headerLine.find(':');
+        if (colon != std::string::npos)
+        {
+            std::string key = headerLine.substr(0, colon);
+            std::string val = headerLine.substr(colon + 1);
+            while (!val.empty() && isspace((unsigned char)val.front())) val.erase(val.begin());
+            std::wstring wkey(key.begin(), key.end());
+            std::wstring wval(val.begin(), val.end());
+            outReq.Headers[wkey] = wval;
+        }
+        pos = end + 2;
+    }
+
+    // Extract body
+    if (headerEnd != std::string::npos)
+        outReq.Body = raw.substr(headerEnd + 4);
+
+    // Detect WebSocket upgrade
+    auto upgradeIt = outReq.Headers.find(L"Upgrade");
+    outReq.IsWebSocketUpgrade = (upgradeIt != outReq.Headers.end() &&
+                                  upgradeIt->second.find(L"websocket") != std::wstring::npos);
+
+    HTTP_LOG(DEBUG, L"Parsed request: %s %s Body=%zu bytes WS=%d",
+        outReq.Method.c_str(), outReq.Path.c_str(),
+        outReq.Body.size(), outReq.IsWebSocketUpgrade ? 1 : 0);
+
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// WriteResponse
+// =============================================================================
+ElleResult ElleHTTPServer::WriteResponse(SOCKET sock, const HttpResponse& resp)
+{
+    std::string serialized = SerializeResponse(resp);
+
+    size_t totalSent = 0;
+    while (totalSent < serialized.size())
+    {
+        int sent = send(sock, serialized.c_str() + totalSent,
+                        (int)(serialized.size() - totalSent), 0);
+        if (sent == SOCKET_ERROR)
+        {
+            HTTP_LOG(WARN, L"send() failed: %d", WSAGetLastError());
+            return ElleResult::ERR_NETWORK_SEND;
+        }
+        totalSent += sent;
+    }
+
+    HTTP_LOG(DEBUG, L"Response sent: %d %s BodyBytes=%zu",
+        resp.StatusCode, resp.StatusText.c_str(), resp.Body.size());
+    return ElleResult::OK;
+}
+
+// =============================================================================
+// Dispatch — find route handler and invoke
+// =============================================================================
+HttpResponse ElleHTTPServer::Dispatch(const HttpRequest& req)
+{
+    HTTP_LOG(INFO, L"Dispatching: %s %s", req.Method.c_str(), req.Path.c_str());
+
+    std::lock_guard<std::mutex> lock(m_RouteMutex);
+
+    // Try exact method + path match
+    auto it = m_Routes.find({ req.Method, req.Path });
+    if (it != m_Routes.end())
+        return it->second(req);
+
+    // Try wildcard method match
+    it = m_Routes.find({ L"*", req.Path });
+    if (it != m_Routes.end())
+        return it->second(req);
+
+    HTTP_LOG(WARN, L"No route for: %s %s", req.Method.c_str(), req.Path.c_str());
+    return HttpResponse::NotFound();
+}
+
+// =============================================================================
+// SerializeResponse — build raw HTTP response bytes
+// =============================================================================
+std::string ElleHTTPServer::SerializeResponse(const HttpResponse& resp)
+{
+    std::ostringstream oss;
+
+    // Status line
+    oss << "HTTP/1.1 " << resp.StatusCode << " ";
+    std::string statusText(resp.StatusText.begin(), resp.StatusText.end());
+    oss << statusText << "\r\n";
+
+    // Standard headers
+    oss << "Server: ElleAnn/3.0\r\n";
+    oss << "Connection: close\r\n";
+    oss << "Content-Length: " << resp.Body.size() << "\r\n";
+    oss << "Access-Control-Allow-Origin: *\r\n";
+
+    // Custom headers
+    for (auto& h : resp.Headers)
+    {
+        if (h.first == L"Content-Length") continue;  // Already written
+        std::string key(h.first.begin(), h.first.end());
+        std::string val(h.second.begin(), h.second.end());
+        oss << key << ": " << val << "\r\n";
+    }
+
+    oss << "\r\n";
+    oss << resp.Body;
+
+    return oss.str();
+}
+
+uint64_t ElleHTTPServer::ActiveConnections() const
+{
+    return (uint64_t)m_ActiveConnections.load(std::memory_order_relaxed);
+}

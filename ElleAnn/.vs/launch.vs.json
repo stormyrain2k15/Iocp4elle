@@ -1,0 +1,12 @@
+{
+  "version": "0.2.1",
+  "defaults": {},
+  "configurations": [
+    {
+      "type": "default",
+      "project": "ElleAnn-2\\CMakeLists.txt",
+      "projectTarget": "ElleAnn-2.exe",
+      "name": "ElleAnn-2.exe"
+    }
+  ]
+}

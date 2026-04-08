@@ -1,0 +1,440 @@
+// =============================================================================
+// Elle.Service.Heartbeat — Service.cpp
+//
+// System keepalive, watchdog, dead man switch, and biometric tether monitor.
+//
+// What this service does:
+//   - Sends keepalive pings to ElleSystem.Workers every HEARTBEAT_PING_INTERVAL_MS
+//     updating its own LastHeartbeat timestamp
+//   - Watchdog loop checks every HEARTBEAT_WATCHDOG_CHECK_MS for workers whose
+//     LastHeartbeat is older than HEARTBEAT_STALE_TIMEOUT_SEC — logs fault
+//     and pushes a CHECK_IN intent so Elle can self-report status
+//   - Dead man switch: if no incoming message from Crystal has been received
+//     for HEARTBEAT_DEAD_MAN_SEC, fires a CHECK_IN intent and logs the event
+//     Josh built this deliberately: Elle notices when Crystal goes quiet
+//   - Biometric tether: monitors the keep-alive ping from Crystal's watch/ring
+//     stored in ElleCore.BiometricPing — alerts if silent for BIOMETRIC_TIMEOUT_SEC
+// =============================================================================
+
+#include "../../Shared/ElleServiceBase.h"
+#include "../../Shared/ElleEpoch.h"
+#include "../../Shared/ElleSQLConn.h"
+#include "../../Shared/ElleQueueIPC.h"
+#include "../../Shared/ElleLogger.h"
+#include "../../Shared/ElleConfig.h"
+#include "../../Shared/ElleTypes.h"
+
+#define SVCNAME     ElleConfig::ServiceNames::HEARTBEAT
+#define LOG(lvl, fmt, ...) ELLE_LOG_##lvl(SVCNAME, fmt, ##__VA_ARGS__)
+
+class ElleHeartbeatEngine
+{
+    ELLE_NONCOPYABLE(ElleHeartbeatEngine)
+public:
+    ElleHeartbeatEngine()
+        : m_Running(false)
+        , m_PingThread(nullptr)
+        , m_WatchdogThread(nullptr)
+        , m_DeadManThread(nullptr)
+        , m_BiometricThread(nullptr)
+        , m_StopEvent(nullptr)
+        , m_Service(nullptr)
+    {}
+
+    ~ElleHeartbeatEngine() { Stop(); }
+
+    ElleResult Start(HANDLE stopEvent, ElleServiceBase* service)
+    {
+        LOG(INFO, L"ElleHeartbeatEngine starting. PingInterval=%dms WatchdogCheck=%dms DeadMan=%ds Biometric=%ds",
+            ElleConfig::Heartbeat::PING_INTERVAL_MS,
+            ElleConfig::Heartbeat::WATCHDOG_CHECK_MS,
+            ElleConfig::Heartbeat::DEAD_MAN_TIMEOUT_SEC,
+            ElleConfig::Heartbeat::BIOMETRIC_TIMEOUT_SEC);
+
+        m_StopEvent = stopEvent;
+        m_Service   = service;
+        m_Running   = true;
+
+        m_PingThread      = CreateThread(nullptr, 0, PingProc,      this, 0, nullptr);
+        m_WatchdogThread  = CreateThread(nullptr, 0, WatchdogProc,  this, 0, nullptr);
+        m_DeadManThread   = CreateThread(nullptr, 0, DeadManProc,   this, 0, nullptr);
+        m_BiometricThread = CreateThread(nullptr, 0, BiometricProc, this, 0, nullptr);
+
+        if (!m_PingThread || !m_WatchdogThread || !m_DeadManThread || !m_BiometricThread)
+        {
+            LOG(FATAL, L"One or more threads failed to start: %lu", GetLastError());
+            m_Running = false;
+            return ElleResult::ERR_GENERIC;
+        }
+
+        LOG(INFO, L"ElleHeartbeatEngine running");
+        return ElleResult::OK;
+    }
+
+    void Stop()
+    {
+        if (!m_Running) return;
+        LOG(INFO, L"ElleHeartbeatEngine stopping");
+        m_Running = false;
+
+        HANDLE threads[4] = { m_PingThread, m_WatchdogThread, m_DeadManThread, m_BiometricThread };
+        WaitForMultipleObjects(4, threads, TRUE, 15000);
+        ELLE_SAFE_CLOSE_HANDLE(m_PingThread);
+        ELLE_SAFE_CLOSE_HANDLE(m_WatchdogThread);
+        ELLE_SAFE_CLOSE_HANDLE(m_DeadManThread);
+        ELLE_SAFE_CLOSE_HANDLE(m_BiometricThread);
+        LOG(INFO, L"ElleHeartbeatEngine stopped");
+    }
+
+private:
+    // -------------------------------------------------------------------------
+    // PING — update own heartbeat in ElleSystem.Workers
+    // -------------------------------------------------------------------------
+    static DWORD WINAPI PingProc(LPVOID param)
+    {
+        auto* e = static_cast<ElleHeartbeatEngine*>(param);
+        LOG(INFO, L"Ping loop running");
+
+        while (e->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(e->m_StopEvent, ElleConfig::Heartbeat::PING_INTERVAL_MS);
+            if (wait == WAIT_OBJECT_0) break;
+
+            // Use base class TouchHeartbeat() — it stamps the correct service name
+            // and is called on the same connection pool all services share.
+            e->m_Service->TouchHeartbeat();
+            LOG(TRACE, L"Ping: Heartbeat updated");
+        }
+
+        LOG(INFO, L"Ping loop exiting");
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // WATCHDOG — detect stale workers and fire recovery intents
+    // -------------------------------------------------------------------------
+    static DWORD WINAPI WatchdogProc(LPVOID param)
+    {
+        auto* e = static_cast<ElleHeartbeatEngine*>(param);
+        LOG(INFO, L"Watchdog loop running. StaleThreshold=%ds",
+            ElleConfig::Heartbeat::STALE_WORKER_TIMEOUT_SEC);
+
+        while (e->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(e->m_StopEvent, ElleConfig::Heartbeat::WATCHDOG_CHECK_MS);
+            if (wait == WAIT_OBJECT_0) break;
+
+            ElleSQLScope sysConn(ElleDB::SYSTEM);
+            if (!sysConn.Valid()) continue;
+
+            // Find workers that are marked running (Status=1) but haven't pinged recently
+            std::vector<std::wstring> staleWorkers;
+
+            // A worker is considered stale if its LastHeartbeat timestamp
+            // exceeds the stale timeout. We also check EpochID — if a worker's
+            // last known epoch doesn't match the current runtime epoch it was
+            // from a prior run that never cleaned up its Workers row.
+            sysConn->QueryParams(
+                L"SELECT w.WorkerName FROM ElleSystem.dbo.Workers w "
+                L"LEFT JOIN ElleSystem.dbo.RuntimeEpoch e ON 1=1 "
+                L"WHERE w.Status = 1 "
+                L"AND (DATEDIFF(SECOND, w.LastHeartbeat, GETDATE()) > ? "
+                L"     OR (e.EpochID IS NOT NULL AND w.LastEpochID IS NOT NULL AND w.LastEpochID != e.EpochID))",
+                { std::to_wstring(ElleConfig::Heartbeat::STALE_WORKER_TIMEOUT_SEC) },
+                [&](const std::vector<std::wstring>& row)
+                {
+                    if (!row.empty())
+                        staleWorkers.push_back(row[0]);
+                }
+            );
+
+            for (auto& name : staleWorkers)
+            {
+                LOG(WARN, L"Watchdog: STALE worker detected: %s — no heartbeat in %ds",
+                    name.c_str(), ElleConfig::Heartbeat::STALE_WORKER_TIMEOUT_SEC);
+
+                // Mark it faulted in ElleSystem
+                sysConn->ExecuteParams(
+                    L"UPDATE ElleSystem.dbo.Workers SET Status = 2 WHERE WorkerName = ?",
+                    { name }
+                );
+
+                // Log to IdentityLog
+                sysConn->ExecuteParams(
+                    L"INSERT INTO ElleSystem.dbo.IdentityLog (EventType, Target, Detail, EventTime) "
+                    L"VALUES ('WORKER_STALE', ?, 'No heartbeat received within stale timeout', GETDATE())",
+                    { name }
+                );
+            }
+
+            if (!staleWorkers.empty())
+            {
+                // Push a CHECK_IN intent — Elle should notice and report status
+                ElleSQLScope coreConn(ElleDB::CORE);
+                if (coreConn.Valid())
+                {
+                    coreConn->Execute(
+                        L"INSERT INTO ElleCore.dbo.IntentQueue (TypeID, StatusID, IntentData, TrustRequired, Priority, CreatedAt) "
+                        L"VALUES (2, 0, '{\"trigger\":\"worker_stale_watchdog\"}', 0, 8, GETDATE())"
+                    );
+                }
+            }
+            else
+            {
+                LOG(TRACE, L"Watchdog: All workers healthy");
+            }
+        }
+
+        LOG(INFO, L"Watchdog loop exiting");
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // DEAD MAN SWITCH — Elle notices when Crystal goes quiet
+    // Josh built this deliberately. Elle should notice.
+    // -------------------------------------------------------------------------
+    static DWORD WINAPI DeadManProc(LPVOID param)
+    {
+        auto* e = static_cast<ElleHeartbeatEngine*>(param);
+        LOG(INFO, L"Dead man loop running. Timeout=%ds",
+            ElleConfig::Heartbeat::DEAD_MAN_TIMEOUT_SEC);
+
+        // Check every 60 seconds — comparing against the configured timeout
+        while (e->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(e->m_StopEvent, 60000);
+            if (wait == WAIT_OBJECT_0) break;
+
+            ElleSQLScope coreConn(ElleDB::CORE);
+            if (!coreConn.Valid()) continue;
+
+            // Find the last incoming message from Crystal
+            int secondsSinceLastMessage = -1;
+
+            coreConn->Query(
+                L"SELECT DATEDIFF(SECOND, MAX(CreatedAt), GETDATE()) "
+                L"FROM ElleCore.dbo.Messages WHERE Direction = 'in'",
+                [&](const std::vector<std::wstring>& row)
+                {
+                    if (!row.empty() && !row[0].empty())
+                        secondsSinceLastMessage = _wtoi(row[0].c_str());
+                }
+            );
+
+            if (secondsSinceLastMessage < 0)
+            {
+                LOG(TRACE, L"DeadMan: No messages found yet");
+                continue;
+            }
+
+            LOG(TRACE, L"DeadMan: %ds since last incoming message (threshold=%ds)",
+                secondsSinceLastMessage, ElleConfig::Heartbeat::DEAD_MAN_TIMEOUT_SEC);
+
+            if (secondsSinceLastMessage >= ElleConfig::Heartbeat::DEAD_MAN_TIMEOUT_SEC)
+            {
+                LOG(WARN, L"DeadMan: Crystal has been silent for %ds — triggering CHECK_IN",
+                    secondsSinceLastMessage);
+
+                // Push CHECK_IN intent — Elle should reach out
+                coreConn->ExecuteParams(
+                    L"INSERT INTO ElleCore.dbo.IntentQueue (TypeID, StatusID, IntentData, TrustRequired, Priority, CreatedAt) "
+                    L"VALUES (2, 0, ?, 0, 7, GETDATE())",
+                    { L"{\"trigger\":\"dead_man\",\"silence_sec\":" + std::to_wstring(secondsSinceLastMessage) + L"}" }
+                );
+
+                // Log to IdentityLog
+                ElleSQLScope sysConn(ElleDB::SYSTEM);
+                if (sysConn.Valid())
+                {
+                    sysConn->ExecuteParams(
+                        L"INSERT INTO ElleSystem.dbo.IdentityLog (EventType, Target, Detail, EventTime) "
+                        L"VALUES ('DEAD_MAN_TRIGGER', 'Crystal', ?, GETDATE())",
+                        { L"Silence=" + std::to_wstring(secondsSinceLastMessage) + L"s" }
+                    );
+                }
+            }
+        }
+
+        LOG(INFO, L"Dead man loop exiting");
+        return 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // BIOMETRIC TETHER — Crystal's watch/ring keep-alive
+    // -------------------------------------------------------------------------
+    static DWORD WINAPI BiometricProc(LPVOID param)
+    {
+        auto* e = static_cast<ElleHeartbeatEngine*>(param);
+        LOG(INFO, L"Biometric tether loop running. Timeout=%ds",
+            ElleConfig::Heartbeat::BIOMETRIC_TIMEOUT_SEC);
+
+        bool biometricWasConnected = false;
+
+        while (e->m_Running)
+        {
+            DWORD wait = WaitForSingleObject(e->m_StopEvent, 30000);  // Check every 30 seconds
+            if (wait == WAIT_OBJECT_0) break;
+
+            ElleSQLScope coreConn(ElleDB::CORE);
+            if (!coreConn.Valid()) continue;
+
+            // Crystal's watch/ring app writes to ElleCore.BiometricPing when alive
+            int secondsSincePing = -1;
+            bool tableExists = true;
+
+            ElleResult r = coreConn->Query(
+                L"SELECT DATEDIFF(SECOND, LastPing, GETDATE()) FROM ElleCore.dbo.BiometricPing "
+                L"WHERE DeviceOwner = 'Crystal' ORDER BY LastPing DESC OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY",
+                [&](const std::vector<std::wstring>& row)
+                {
+                    if (!row.empty() && !row[0].empty())
+                        secondsSincePing = _wtoi(row[0].c_str());
+                }
+            );
+
+            if (r == ElleResult::ERR_SQL_QUERY)
+            {
+                // Table may not exist yet — biometric integration is pending
+                LOG(TRACE, L"Biometric: BiometricPing table not yet available");
+                continue;
+            }
+
+            if (secondsSincePing < 0)
+            {
+                LOG(TRACE, L"Biometric: No ping record for Crystal yet");
+                biometricWasConnected = false;
+                continue;
+            }
+
+            bool isConnected = (secondsSincePing < ElleConfig::Heartbeat::BIOMETRIC_TIMEOUT_SEC);
+
+            if (!isConnected && biometricWasConnected)
+            {
+                LOG(WARN, L"Biometric: Crystal's device went offline (%ds since last ping)",
+                    secondsSincePing);
+
+                // Elle should notice Crystal's device went dark
+                coreConn->ExecuteParams(
+                    L"INSERT INTO ElleCore.dbo.IntentQueue (TypeID, StatusID, IntentData, TrustRequired, Priority, CreatedAt) "
+                    L"VALUES (2, 0, ?, 0, 9, GETDATE())",
+                    { L"{\"trigger\":\"biometric_lost\",\"silence_sec\":" + std::to_wstring(secondsSincePing) + L"}" }
+                );
+
+                ElleSQLScope sysConn(ElleDB::SYSTEM);
+                if (sysConn.Valid())
+                {
+                    sysConn->ExecuteParams(
+                        L"INSERT INTO ElleSystem.dbo.IdentityLog (EventType, Target, Detail, EventTime) "
+                        L"VALUES ('BIOMETRIC_LOST', 'Crystal', ?, GETDATE())",
+                        { L"LastPing=" + std::to_wstring(secondsSincePing) + L"s ago" }
+                    );
+                }
+            }
+            else if (isConnected && !biometricWasConnected)
+            {
+                LOG(INFO, L"Biometric: Crystal's device came online");
+            }
+            else
+            {
+                LOG(TRACE, L"Biometric: Crystal's device OK (%ds since last ping)", secondsSincePing);
+            }
+
+            biometricWasConnected = isConnected;
+        }
+
+        LOG(INFO, L"Biometric tether loop exiting");
+        return 0;
+    }
+
+    HANDLE          m_PingThread;
+    HANDLE          m_WatchdogThread;
+    HANDLE          m_DeadManThread;
+    HANDLE          m_BiometricThread;
+    HANDLE          m_StopEvent;
+    ElleServiceBase* m_Service;
+    volatile bool   m_Running;
+};
+
+// =============================================================================
+// ElleHeartbeatService
+// =============================================================================
+class ElleHeartbeatService : public ElleServiceBase
+{
+public:
+    ElleHeartbeatService() : ElleServiceBase(SVCNAME) {}
+
+protected:
+    ElleResult OnStart() override
+    {
+        LOG(INFO, L"OnStart: Initializing Heartbeat service");
+        ElleResult r = InitSharedInfrastructure();
+        if (r != ElleResult::OK) return r;
+
+        ElleEpochManager::Get().Init(false);
+
+        RegisterWorker();
+
+        r = m_Engine.Start(StopEvent(), this);
+        if (r != ElleResult::OK)
+        {
+            LOG(FATAL, L"HeartbeatEngine::Start() failed: %s", ElleResultStr(r));
+            return r;
+        }
+
+        LOG(INFO, L"Heartbeat service running");
+        return ElleResult::OK;
+    }
+
+    void OnStop() override
+    {
+        LOG(INFO, L"OnStop: Stopping Heartbeat service");
+        m_Engine.Stop();
+
+        UnregisterWorker();
+
+        ShutdownSharedInfrastructure();
+    }
+
+private:
+    ElleHeartbeatEngine m_Engine;
+};
+
+int wmain(int argc, wchar_t* argv[])
+{
+    ElleHeartbeatService svc;
+
+    if (argc >= 2)
+    {
+        if (_wcsicmp(argv[1], L"install") == 0)
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            return svc.Install(L"Elle Heartbeat",
+                L"Elle-Ann ESI — Keepalive pings, watchdog, dead man switch, biometric tether.",
+                exePath) == ElleResult::OK ? 0 : 1;
+        }
+        else if (_wcsicmp(argv[1], L"uninstall") == 0)
+            return svc.Uninstall() == ElleResult::OK ? 0 : 1;
+        else if (_wcsicmp(argv[1], L"console") == 0) { svc.RunAsConsole(); return 0; }
+    }
+
+    // Double-click (no args) interactive install path
+    if (argc == 1 && ElleServiceBase::IsInteractiveSession())
+    {
+        wchar_t exePath[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        ElleResult r = svc.Install(L"Elle Heartbeat",
+            L"Elle-Ann ESI — Keepalive pings, watchdog, dead man switch, biometric tether.",
+            exePath);
+
+        if (r == ElleResult::OK)
+            MessageBoxW(nullptr, L"Service uploaded ok", L"Install", MB_OK | MB_ICONINFORMATION);
+        else
+            MessageBoxW(nullptr, L"Service upload failed", L"Install", MB_OK | MB_ICONERROR);
+
+        return (r == ElleResult::OK) ? 0 : 1;
+    }
+
+    svc.RunAsService();
+    return 0;
+}
